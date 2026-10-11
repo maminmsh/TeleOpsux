@@ -11,6 +11,7 @@ import {
 } from "./format";
 import { shq } from "../exec/exec-runner";
 import { basename } from "../shared/paths";
+import path from "node:path";
 import {
   DENY_MESSAGE,
   canManageProject,
@@ -50,6 +51,8 @@ interface UserState {
   liveMessageId?: number;
   /** Waiting for the second tap on "delete my credential". */
   pendingKeyDelete?: boolean;
+  /** Per-user working directory for the restricted file commands. */
+  shell?: { hostId: number; cwd: string };
 }
 
 /** Hard caps so a history/log dump can never exceed Telegram's 4096-char limit. */
@@ -128,6 +131,120 @@ export class TelegramController {
   /** Per-user "active server": own host first, global only for admins/owners. */
   private hostIdForUser(userId: number): number | null {
     return effectiveActiveHostId(this.app, userId);
+  }
+
+  /** Canonicalize a directory on the selected host without using a shell string. */
+  private async canonicalRemoteDir(hostId: number, candidate: string): Promise<string | null> {
+    const r = await this.app.serverMode.execOnHost(hostId, "pwd", [], candidate);
+    if (r.code !== 0) return null;
+    return r.stdout.trim() || null;
+  }
+
+  private isWithin(root: string, candidate: string): boolean {
+    return candidate === root || candidate.startsWith(`${root}/`);
+  }
+
+  /**
+   * A file command is deliberately constrained to projects visible to the
+   * caller.  This is a browser, not a general SSH shell: it prevents a bot
+   * user from turning /cd or /mkdir into host-wide access.
+   */
+  private async shellContext(ctx: Context): Promise<{
+    hostId: number;
+    cwd: string;
+    roots: Array<{ root: string; writable: boolean }>;
+  } | null> {
+    const uid = ctx.from!.id;
+    const hostId = this.hostIdForUser(uid);
+    if (hostId === null) {
+      await ctx.reply("🔌 No server selected. Run /addserver or choose one with /hosts.");
+      return null;
+    }
+    const projects = this.app.db
+      .listRemoteProjects(hostId)
+      .filter((p) => projectVisibleTo(this.app, uid, p));
+    if (!projects.length) {
+      await ctx.reply("📁 Register one of your projects first with /addproject <absolute path>.");
+      return null;
+    }
+    const roots = (await Promise.all(projects.map(async (p) => {
+      const root = await this.canonicalRemoteDir(hostId, p.root);
+      return root ? { root, writable: canManageProject(this.app, uid, p) } : null;
+    }))).filter((v): v is { root: string; writable: boolean } => v !== null);
+    if (!roots.length) {
+      await ctx.reply("❌ Your registered project directory is not available on the selected server.");
+      return null;
+    }
+    const state = this.st(uid);
+    const saved = state.shell;
+    const cwd = saved && saved.hostId === hostId && roots.some((r) => this.isWithin(r.root, saved.cwd))
+      ? saved.cwd
+      : roots[0]!.root;
+    state.shell = { hostId, cwd };
+    return { hostId, cwd, roots };
+  }
+
+  private async pwdCommand(ctx: Context): Promise<void> {
+    const shell = await this.shellContext(ctx);
+    if (shell) await ctx.reply(`📂 ${shell.cwd}`);
+  }
+
+  private async cdCommand(ctx: Context): Promise<void> {
+    const target = this.cmdArg(ctx);
+    if (!target) return void (await this.pwdCommand(ctx));
+    const shell = await this.shellContext(ctx);
+    if (!shell) return;
+    const candidate = target.startsWith("/") ? target : path.posix.join(shell.cwd, target);
+    const resolved = await this.canonicalRemoteDir(shell.hostId, candidate);
+    if (!resolved || !shell.roots.some((r) => this.isWithin(r.root, resolved))) {
+      await ctx.reply("⛔ Directory is unavailable or outside your registered projects.");
+      return;
+    }
+    this.st(ctx.from!.id).shell = { hostId: shell.hostId, cwd: resolved };
+    await ctx.reply(`📂 ${resolved}`);
+  }
+
+  private async lsCommand(ctx: Context): Promise<void> {
+    const target = this.cmdArg(ctx);
+    const shell = await this.shellContext(ctx);
+    if (!shell) return;
+    let cwd = shell.cwd;
+    if (target) {
+      const candidate = target.startsWith("/") ? target : path.posix.join(shell.cwd, target);
+      const resolved = await this.canonicalRemoteDir(shell.hostId, candidate);
+      if (!resolved || !shell.roots.some((r) => this.isWithin(r.root, resolved))) {
+        await ctx.reply("⛔ Directory is unavailable or outside your registered projects.");
+        return;
+      }
+      cwd = resolved;
+    }
+    const r = await this.app.serverMode.execOnHost(shell.hostId, "ls", ["-la"], cwd);
+    if (r.code !== 0) {
+      await ctx.reply(`❌ Cannot list directory: ${this.clip(r.stderr || "command failed")}`);
+      return;
+    }
+    await ctx.reply(`📂 ${cwd}\n\n${this.clip(redactSecrets(r.stdout)) || "(empty)"}`);
+  }
+
+  private async mkdirCommand(ctx: Context): Promise<void> {
+    const name = this.cmdArg(ctx);
+    if (!name || name.includes("/") || name === "." || name === "..") {
+      await ctx.reply("Usage: /mkdir <single-directory-name>");
+      return;
+    }
+    const shell = await this.shellContext(ctx);
+    if (!shell) return;
+    const writable = shell.roots.some((r) => r.writable && this.isWithin(r.root, shell.cwd));
+    if (!writable) {
+      await ctx.reply("⛔ You can create directories only inside a project you own.");
+      return;
+    }
+    const r = await this.app.serverMode.execOnHost(shell.hostId, "mkdir", ["--", name], shell.cwd);
+    if (r.code !== 0) {
+      await ctx.reply(`❌ mkdir failed: ${this.clip(r.stderr || "command failed")}`);
+      return;
+    }
+    await ctx.reply(`✅ Created ${shell.cwd}/${name}`);
   }
 
   private sessionCounts(userId: number): Record<string, number> {
@@ -450,6 +567,7 @@ export class TelegramController {
           "/addproject      register a project path on the server",
           "/removeproject <id>",
           "/projects        list projects you can access",
+          "/pwd /ls [dir] /cd <dir> /mkdir <name>  browse your registered projects",
           "/sessions        list YOUR sessions (admins see all)",
           "/new             create a session (remote projects only)",
           "/session <id>    chat with one of your sessions",
@@ -517,6 +635,13 @@ export class TelegramController {
     });
 
     this.bot.command("removeproject", (ctx) => this.removeProjectCommand(ctx));
+
+    // Deliberately small, project-confined file browser. These are not a raw
+    // shell and accept no arbitrary Linux commands or flags.
+    this.bot.command("pwd", (ctx) => this.pwdCommand(ctx));
+    this.bot.command("ls", (ctx) => this.lsCommand(ctx));
+    this.bot.command("cd", (ctx) => this.cdCommand(ctx));
+    this.bot.command("mkdir", (ctx) => this.mkdirCommand(ctx));
 
     this.bot.command("projects", (ctx) => {
       const uid = ctx.from!.id;
@@ -917,7 +1042,10 @@ export class TelegramController {
       return;
     }
 
-    const exists = await app.runner.exec("test", ["-d", path]);
+    // Do not use app.runner here: it is the long-lived transport used by
+    // tmux/monitoring and can belong to another user's selected host. Project
+    // registration must validate against the host selected by THIS caller.
+    const exists = await app.serverMode.execOnHost(hostId, "test", ["-d", path]);
     if (exists.code !== 0) {
       await ctx.reply(`❌ Directory not found on the server: ${path}\n(${exists.stderr.slice(0, 200)})`);
       return;
@@ -932,7 +1060,12 @@ export class TelegramController {
       return;
     }
 
-    const isRepo = await app.git.isRepo(path);
+    const repoCheck = await app.serverMode.execOnHost(
+      hostId,
+      "git",
+      ["-C", path, "rev-parse", "--is-inside-work-tree"],
+    );
+    const isRepo = repoCheck.code === 0 && repoCheck.stdout.trim() === "true";
     const project = app.db.createProject(basename(path), path, hostId, uid, "private");
     await ctx.reply(
       `📁 Project #${project.id} "${project.name}" registered → ${path}\n` +
@@ -1579,6 +1712,10 @@ export class TelegramController {
       { command: "hosts", description: "My servers / pick active server" },
       { command: "addproject", description: "Register a project path on the server" },
       { command: "projects", description: "List my projects" },
+      { command: "pwd", description: "Show current project directory" },
+      { command: "ls", description: "List current project directory" },
+      { command: "cd", description: "Change directory inside a project" },
+      { command: "mkdir", description: "Create a directory in my project" },
       { command: "sessions", description: "List my AI sessions" },
       { command: "new", description: "Create a session" },
       { command: "send", description: "Send a message to a session: /send <id> <text>" },

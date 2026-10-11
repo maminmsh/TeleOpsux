@@ -79,6 +79,30 @@ export class ServerModeService {
     if (wasRunning) this.ensureMonitorRunning();
   }
 
+  /**
+   * Execute one non-interactive command against a specific registered host.
+   *
+   * The long-lived transport is intentionally global because it owns tmux and
+   * the monitor.  Telegram requests, however, must not silently run on the
+   * last administrator-selected host when a normal user has selected a
+   * different private host.  A short-lived connection makes that boundary
+   * explicit and is suitable for validation and the restricted file browser.
+   */
+  async execOnHost(hostId: number, cmd: string, args: string[], cwd?: string) {
+    const host = this.hosts.getHost(hostId);
+    if (!host) throw new Error(`Host #${hostId} not found`);
+    const conn = new SshConnection(this.hosts.getCredentials(host), {
+      keepaliveMs: this.app.config.ssh.keepalive_seconds * 1000,
+      readyTimeoutMs: this.app.config.ssh.ready_timeout_seconds * 1000,
+    });
+    const runner = new SshRunner(conn);
+    try {
+      return await runner.exec(cmd, args, { cwd, timeoutMs: 15_000 });
+    } finally {
+      conn.close();
+    }
+  }
+
   ensureMonitorRunning(): void {
     this.monitorRunning = true;
     this.app.monitor.start();
