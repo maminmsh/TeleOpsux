@@ -46,7 +46,7 @@ export interface AgentAdapter {
   /**
    * When set, every session of this agent needs the OWNER's own per-user
    * credential (fail-closed — no shared server login). The value is the env
-   * var the launch command exports, e.g. "QODER_API_KEY".
+   * var the launch command exports, e.g. "QODER_PERSONAL_ACCESS_TOKEN".
    */
   readonly credentialEnvVar?: string;
 

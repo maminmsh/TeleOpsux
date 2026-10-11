@@ -108,7 +108,7 @@ function buildApp() {
       ids: () => ["shell"],
       get: (id: string) =>
         id === "qoder"
-          ? ({ id: "qoder", credentialEnvVar: "QODER_API_KEY" } as never)
+          ? ({ id: "qoder", credentialEnvVar: "QODER_PERSONAL_ACCESS_TOKEN" } as never)
           : undefined,
     },
     git,
@@ -211,6 +211,27 @@ describe("telegram layer: user B cannot touch user A's resources", () => {
     assert.ok(ctxA.replies.some((r) => r.startsWith("✅ Sent")));
     // output was redacted before echoing
     assert.ok(!ctxA.replies.join("\n").includes("hunter2"));
+  });
+
+  it("/qoder forwards raw interactive commands, including slash commands Telegram would consume", async () => {
+    const { db, controller, calls } = buildApp();
+    const qoder = db.createSession({
+      name: "qoder",
+      project_id: null,
+      agent_type: "qoder",
+      cwd: "/tmp",
+      owner_telegram_user_id: USER_A,
+    });
+
+    const owner = fakeCtx(USER_A, { match: `${qoder.id} /help` });
+    await controller.qoderCommand(owner as never);
+    assert.deepEqual(calls.sendInput, [{ id: qoder.id, text: "/help" }]);
+    assert.ok(owner.replies.some((r) => r.startsWith("✅ Sent to Qoder session")));
+
+    const foreign = fakeCtx(USER_B, { match: `${qoder.id} /status` });
+    await controller.qoderCommand(foreign as never);
+    assert.deepEqual(foreign.replies, [DENIED]);
+    assert.equal(calls.sendInput.length, 1);
   });
 
   it("/history: foreign session denied; owner sees own messages", async () => {

@@ -205,7 +205,7 @@ agent needs the owner's credential, otherwise
 
 is replied and the session is **not created and not started** (checked in the
 Telegram layer *and* independently in `SessionManager.create/start`, so no other
-entry point can bypass it). There is no fallback to a server-wide `QODER_API_KEY`
+entry point can bypass it). There is no fallback to a server-wide `QODER_PERSONAL_ACCESS_TOKEN`
 or a shared `qoder` login: the launch command explicitly `unset`s an inherited
 variable before exporting the owner's.
 
@@ -227,8 +227,8 @@ stored key.
 **Launch injection** (`SessionManager.start`): the key is written through the
 runner's *stdin* into `$HOME/.teleops-credentials/teleops-session-<id>.key`
 (`umask 077`, `chmod 600`) on the session host, and the pane command only ever
-shows the path — `sh -c 'unset QODER_API_KEY; QODER_API_KEY="$(cat …)"; rm -f …;
-export QODER_API_KEY; exec qoder'`. The file deletes itself as the agent starts,
+shows the path — `sh -c 'unset QODER_PERSONAL_ACCESS_TOKEN QODER_API_KEY; QODER_PERSONAL_ACCESS_TOKEN="$(cat …)"; rm -f …;
+export QODER_PERSONAL_ACCESS_TOKEN; exec qoder'`. The file deletes itself as the agent starts,
 and `stop()` (or a failed launch) removes any leftover. The plaintext is thus
 absent from argv, the tmux pane, `capture-pane`, task logs, session history,
 notifications and TeleOps' own process environment. As defence in depth every
@@ -259,7 +259,7 @@ npm run typecheck
 `test/credentials.test.ts` proves the isolation contract: A's session gets
 exactly A's key (and B's appears nowhere in it), B cannot create or start a
 Qoder session while unprovisioned even though A is, a server-wide
-`QODER_API_KEY` is never inherited, the plaintext never appears in a command
+`QODER_PERSONAL_ACCESS_TOKEN` (or the legacy `QODER_API_KEY`) is never inherited, the plaintext never appears in a command
 line / pane / capture / history / DB file, output is scrubbed, provisioning
 links are single-use, and deletion is confirmed and per-user.
 

@@ -309,7 +309,8 @@ describe("per-user Qoder credentials: session isolation", () => {
 
   it("never falls back to a server-wide key: the pane unsets an inherited one", async () => {
     const { creds, runner, sessions, config, project } = build();
-    process.env.QODER_API_KEY = "SERVER-SHARED-KEY";
+    process.env.QODER_PERSONAL_ACCESS_TOKEN = "SERVER-SHARED-KEY";
+    process.env.QODER_API_KEY = "LEGACY-SHARED-KEY";
     try {
       // A shared key on the server host must NOT let an unprovisioned user run.
       await assert.rejects(
@@ -332,10 +333,15 @@ describe("per-user Qoder credentials: session isolation", () => {
       });
       await sessions.start(a.id);
       const launch = runner.pane.get(target(config.sessions.tmux_prefix, a.id))!;
-      assert.ok(launch.includes("unset QODER_API_KEY"), "inherited key must be cleared");
+      assert.ok(
+        launch.includes("unset QODER_PERSONAL_ACCESS_TOKEN QODER_API_KEY"),
+        "current and legacy inherited keys must be cleared",
+      );
       assert.ok(!launch.includes("SERVER-SHARED-KEY"));
+      assert.ok(!launch.includes("LEGACY-SHARED-KEY"));
       assert.ok(!runner.injectedEnv(target(config.sessions.tmux_prefix, a.id)).value?.includes("SERVER"));
     } finally {
+      delete process.env.QODER_PERSONAL_ACCESS_TOKEN;
       delete process.env.QODER_API_KEY;
     }
   });
@@ -388,7 +394,7 @@ describe("per-user Qoder credentials: output never leaks", () => {
     const { creds } = build();
     creds.save(USER_A, KEY_A);
     creds.save(USER_B, KEY_B);
-    const noisy = `export QODER_API_KEY=${KEY_A}\nthen ${KEY_B} again ${KEY_A}`;
+    const noisy = `export QODER_PERSONAL_ACCESS_TOKEN=${KEY_A}\nthen ${KEY_B} again ${KEY_A}`;
     const clean = creds.redactAll(noisy);
     assert.ok(!clean.includes(KEY_A));
     assert.ok(!clean.includes(KEY_B));

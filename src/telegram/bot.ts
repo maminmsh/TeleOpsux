@@ -437,6 +437,38 @@ export class TelegramController {
     }
   }
 
+  /**
+   * /qoder <sessionId> <input> — pass raw Qoder TUI input through Telegram.
+   * Telegram consumes leading slash commands itself, so chat mode cannot carry
+   * Qoder commands such as `/help`, `/status`, or `/login` unchanged.
+   */
+  async qoderCommand(ctx: Context): Promise<void> {
+    const arg = this.cmdArg(ctx);
+    const m = arg.match(/^(\d+)\s+([\s\S]+)$/);
+    if (!m) {
+      await ctx.reply("Usage: /qoder <session id> <Qoder input>\nExample: /qoder 12 /help");
+      return;
+    }
+    const id = Number(m[1]);
+    const s = this.ownedSession(ctx, id);
+    if (!s) return this.deny(ctx);
+    if (s.agent_type !== "qoder") {
+      await ctx.reply(`Session #${id} is ${s.agent_type}, not Qoder.`);
+      return;
+    }
+    try {
+      // Deliberately forward byte-for-byte after the session id: this is TUI
+      // input, never a shell command, and still goes through secret checks.
+      await this.app.sessions.sendInput(id, m[2]!);
+      const out = await this.app.sessions.capture(id, 15);
+      await ctx.reply(
+        `✅ Sent to Qoder session #${id}.\n\nLatest output:\n${this.clip(this.scrub(out)) || "(no output yet)"}`,
+      );
+    } catch (e) {
+      await this.fail(ctx, e);
+    }
+  }
+
   /** /history <sessionId> [limit] — full executive history of the user's session. */
   async historyCommand(ctx: Context): Promise<void> {
     const args = this.cmdArgs(ctx);
@@ -582,6 +614,7 @@ export class TelegramController {
           "/new             create a session (remote projects only)",
           "/session <id>    chat with one of your sessions",
           "/send <id> <msg> send a message straight to your session without chat mode",
+          "/qoder <id> <input> send raw Qoder TUI input (e.g. /qoder 12 /help)",
           "/history <id> [limit]  input/output + event history of your session",
           "/stop <id> /resume <id> /kill <id>",
           "/summary <id>    rule-based summary",
@@ -680,6 +713,7 @@ export class TelegramController {
     });
 
     this.bot.command("send", (ctx) => this.sendCommand(ctx));
+    this.bot.command("qoder", (ctx) => this.qoderCommand(ctx));
 
     // A key is never typed into chat — /qoderkey hands out a single-use link.
     this.bot.command("qoderkey", (ctx) => this.qoderKeyCommand(ctx));
@@ -1734,6 +1768,7 @@ export class TelegramController {
       { command: "sessions", description: "List my AI sessions" },
       { command: "new", description: "Create a session" },
       { command: "send", description: "Send a message to a session: /send <id> <text>" },
+      { command: "qoder", description: "Send raw Qoder input: /qoder <id> <input>" },
       { command: "history", description: "Session history: /history <id> [limit]" },
       { command: "qoderkey", description: "Store my Qoder credential via a one-time secure link" },
       { command: "logs", description: "Task logs: /logs [session id] [limit]" },

@@ -17,7 +17,8 @@ const SECRET_FILE_PATH_RE = /^\$HOME\/\.teleops-credentials\/teleops-session-\d+
 export class QoderAdapter extends BaseAdapter {
   readonly id = "qoder";
   readonly name = "Qoder";
-  readonly credentialEnvVar = "QODER_API_KEY";
+  /** Official Qoder CLI environment variable for a Personal Access Token. */
+  readonly credentialEnvVar = "QODER_PERSONAL_ACCESS_TOKEN";
 
   constructor(private command = "qoder") {
     super();
@@ -33,7 +34,9 @@ export class QoderAdapter extends BaseAdapter {
     // the pane command shows only the FILE PATH; $(cat …) runs inside the
     // pane's shell at launch, and the file is gone once read
     return (
-      `sh -c 'unset ${this.credentialEnvVar}; ` +
+      // Clear both the current PAT variable and the project's former variable:
+      // a session must never silently inherit a server-wide credential.
+      `sh -c 'unset ${this.credentialEnvVar} QODER_API_KEY; ` +
       `${this.credentialEnvVar}="$(cat "${f}")"; rm -f "${f}"; ` +
       `export ${this.credentialEnvVar}; exec ${this.command}'`
     );
