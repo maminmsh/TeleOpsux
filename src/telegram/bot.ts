@@ -51,6 +51,8 @@ interface UserState {
   liveMessageId?: number;
   /** Waiting for the second tap on "delete my credential". */
   pendingKeyDelete?: boolean;
+  /** "Set token" tapped — the next message is treated as the token. */
+  pendingKeyEntry?: { promptMsgId: number };
   /** Per-user working directory for the restricted file commands. */
   shell?: { hostId: number; cwd: string };
 }
@@ -298,6 +300,7 @@ export class TelegramController {
     s.serverWizard = undefined;
     s.projectWizard = undefined;
     s.wizard = undefined;
+    s.pendingKeyEntry = undefined;
   }
 
   private healthText(): string {
@@ -529,6 +532,11 @@ export class TelegramController {
     if (!text) return;
     const state = this.st(ctx.from!.id);
 
+    if (state.pendingKeyEntry) {
+      if (text.startsWith("/")) return;
+      await this.handleKeyEntry(ctx, text);
+      return;
+    }
     if (state.serverWizard) {
       if (text.startsWith("/")) return;
       await this.handleServerWizard(ctx, text);
@@ -621,8 +629,8 @@ export class TelegramController {
           "/summary <id>    rule-based summary",
           "/git <id>        git status for a session",
           "/logs [id] [limit]  task logs of your sessions",
-          "/qoderkey      status of YOUR Qoder credential + the secure setup form",
-          "                 (never paste an API key into this chat)",
+          "/qoderkey      status of YOUR Qoder credential + set/replace/delete token",
+          "                 (the token message is deleted right after saving)",
           "/memory [project id] recent tasks memory",
           "/cancel          abort the current wizard",
           "",
@@ -716,7 +724,8 @@ export class TelegramController {
     this.bot.command("send", (ctx) => this.sendCommand(ctx));
     this.bot.command("qoder", (ctx) => this.qoderCommand(ctx));
 
-    // A key is never typed into chat — /qoderkey hands out a single-use link.
+    // /qoderkey — status + token entry: the bot takes the token as a chat
+    // reply ONLY inside that flow and deletes both messages right after saving.
     this.bot.command("qoderkey", (ctx) => this.qoderKeyCommand(ctx));
     this.bot.command("qoder-key", (ctx) => this.qoderKeyCommand(ctx));
 
@@ -1234,8 +1243,8 @@ export class TelegramController {
     ) {
       await ctx.reply(
         CREDENTIAL_REQUIRED_MESSAGE +
-          "\n\nRun /qoderkey and open the secure setup form. " +
-          "Your task text is kept — send it again after provisioning.",
+          "\n\nRun /qoderkey, tap “Set token” and reply with your token. " +
+          "Your task text is kept — send it again after storing the token.",
       );
       return;
     }
@@ -1346,15 +1355,14 @@ export class TelegramController {
 
   // ---------- per-user Qoder credential ----------
   /**
-   * /qoderkey — the credential itself is NEVER accepted in chat: Telegram
-   * messages persist, can be forwarded and cannot be reliably deleted. Either a
-   * Mini App button (validated initData over HTTPS) or a single-use link is
-   * offered, and only the status (configured/missing/invalid) is shown here.
+   * /qoderkey — status (configured/missing/invalid) plus token entry: the user
+   * opens the Qoder PAT page, taps "Set token" and replies with the token.
+   * Outside that explicit flow a token is still refused in chat; inside it the
+   * bot saves the token encrypted and deletes both messages immediately.
    */
   private async qoderKeyCommand(ctx: Context): Promise<void> {
     const uid = ctx.from!.id;
     const status = this.app.credentials.status(uid);
-    const provision = this.app.provision;
     const lines = [
       "🔑 QODER CREDENTIAL",
       "",
@@ -1366,48 +1374,92 @@ export class TelegramController {
       "",
       "Create, view, or revoke your Qoder Personal Access Tokens (PATs) here:",
       QODER_PAT_URL,
-      "TeleOps keeps one encrypted Qoder CLI credential for your account; token values are never listed.",
+      "",
+      "To store or replace your token: tap the button below, then reply with the " +
+        "token. Both your message and the prompt are deleted right after saving, " +
+        "so the token does not stay in this chat.",
+      "",
+      "TeleOps keeps ONE encrypted token per account — a new token replaces the " +
+      "old one. Token values are never listed.",
     ];
     const kb = new InlineKeyboard();
-    const appUrl = provision?.miniAppUrl() ?? null;
-    if (appUrl) {
-      // Telegram Mini App: the token travels once, over HTTPS, straight from the
-      // form to the backend — never through chat, a URL or callback data.
-      lines.push(
-        "",
-        "Tap the button to open the secure form inside Telegram. It authenticates your",
-        "Telegram account, submits the token once over HTTPS and forgets it immediately.",
-        "",
-        "Do NOT paste the token into this chat — it would be stored in history.",
-      );
-      kb.webApp("🔐 Open Secure Qoder Setup", appUrl).row();
-    } else if (!provision) {
-      lines.push(
-        "",
-        "⚠️ Self-service provisioning is disabled on this deployment " +
-          "(credentials.provision.enabled). Ask the operator to store your credential " +
-          "through a secure path.",
-      );
-    } else {
-      lines.push(
-        "",
-        "⚠️ No HTTPS Mini App is configured on this deployment " +
-          "(TELEOPS_MINI_APP_URL), so provisioning falls back to a single-use link.",
-      );
-      const token = this.app.credentials.createProvisionToken(uid);
-      lines.push(
-        "",
-        `After creating a PAT, open this ONE-TIME link (valid ${this.app.config.credentials.token_ttl_minutes} minutes, ` +
-          "single use) and paste it into the form:",
-        "",
-        provision.linkFor(token),
-        "",
-        "Do NOT paste the key into this chat — it would be stored in history.",
-      );
-    }
+    kb.text(status === "missing" ? "🔐 Set token" : "🔄 Replace token", "keyset").row();
     if (status !== "missing") kb.text("🗑 Delete my credential", "keydel").row();
     kb.text("⬅ Back", "menu:main");
     await ctx.reply(lines.join("\n"), { reply_markup: kb });
+  }
+
+  /** Ask for the token as a chat reply; the next message is treated as the token. */
+  private async handleKeySet(ctx: Context): Promise<void> {
+    const state = this.st(ctx.from!.id);
+    const sent = await ctx.reply(
+      "🔐 Send your Qoder token now as a plain message.\n\n" +
+        "It is validated, encrypted and saved immediately; I then delete your " +
+        "message and this prompt so the token does not remain in chat history.\n" +
+        "Type /cancel to abort without saving.",
+    );
+    state.pendingKeyEntry = { promptMsgId: sent.message_id };
+  }
+
+  /**
+   * The token entry point the user opted into via "Set token": normalize →
+   * optional live probe → encrypted save → delete both messages → confirm.
+   * The value is never echoed, logged or forwarded.
+   */
+  private async handleKeyEntry(ctx: Context, text: string): Promise<void> {
+    const app = this.app;
+    const uid = ctx.from!.id;
+    const state = this.st(uid);
+    const prompt = state.pendingKeyEntry;
+    if (!prompt) return;
+    const key = app.credentials.normalizeKey(text);
+    if (key === null) {
+      await ctx.reply(
+        "❌ That doesn't look like a usable token (8–512 characters, no spaces or " +
+          "line breaks). Send the correct token, or /cancel to abort.",
+      );
+      return;
+    }
+    if (app.patValidator?.active) {
+      const verdict = await app.patValidator.check(key);
+      if (verdict.kind === "rejected") {
+        await ctx.reply(
+          "⛔ Qoder rejected that token — nothing was saved.\n" +
+            `Create a new PAT at ${QODER_PAT_URL} and reply again, or /cancel.`,
+        );
+        return;
+      }
+    }
+    try {
+      app.credentials.save(uid, key);
+    } catch (e) {
+      await this.fail(ctx, e);
+      return;
+    }
+    state.pendingKeyEntry = undefined;
+    const chatId = ctx.chat?.id;
+    const userMsgId = ctx.msg?.message_id;
+    let wiped = true;
+    const ids = [userMsgId, prompt.promptMsgId].filter((i): i is number => i != null);
+    if (chatId != null) {
+      for (const id of ids) {
+        try {
+          await this.bot.api.deleteMessage(chatId, id);
+        } catch {
+          wiped = false;
+          app.logs.system.warn("could not delete token message — remove it manually");
+        }
+      }
+    } else {
+      wiped = false;
+    }
+    await ctx.reply(
+      "✅ Token saved (encrypted at rest). Status: configured.\n" +
+        "Your own Qoder sessions will use it; other users are unaffected." +
+        (wiped
+          ? "\n🧹 The token message and the prompt were deleted."
+          : "\n⚠️ I could not delete the messages — remove the token message from this chat manually."),
+    );
   }
 
   /** Deletion asks for explicit confirmation, then removes only this user's key. */
@@ -1430,7 +1482,7 @@ export class TelegramController {
       state.pendingKeyDelete = true;
       await ctx.reply(
         "⚠️ Delete your Qoder credential? Your own Qoder sessions will not start " +
-          "until you provision a new one.",
+          "until you set a new token.",
         {
           reply_markup: new InlineKeyboard()
             .text("✅ Yes, delete", "keydel:yes")
@@ -1562,6 +1614,11 @@ export class TelegramController {
           break;
         }
       }
+      return ack();
+    }
+
+    if (data === "keyset") {
+      await this.handleKeySet(ctx);
       return ack();
     }
 
@@ -1793,7 +1850,7 @@ export class TelegramController {
       { command: "send", description: "Send a message to a session: /send <id> <text>" },
       { command: "qoder", description: "Send raw Qoder input: /qoder <id> <input>" },
       { command: "history", description: "Session history: /history <id> [limit]" },
-      { command: "qoderkey", description: "Store my Qoder credential in a secure form" },
+      { command: "qoderkey", description: "Qoder token: status, set/replace, delete" },
       { command: "logs", description: "Task logs: /logs [session id] [limit]" },
       { command: "git", description: "Git status for a session" },
       { command: "memory", description: "Recent tasks memory of a project" },

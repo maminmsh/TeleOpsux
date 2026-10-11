@@ -17,7 +17,6 @@ import {
   CredentialRequiredError,
   CredentialService,
 } from "../src/credentials/credential-service";
-import { ProvisionServer } from "../src/credentials/provision-server";
 import { TelegramController } from "../src/telegram/bot";
 import type { ExecOptions, ExecResult, ExecRunner } from "../src/exec/exec-runner";
 import type { App } from "../src/core/container";
@@ -410,97 +409,12 @@ describe("per-user Qoder credentials: output never leaks", () => {
   });
 });
 
-describe("per-user Qoder credentials: provisioning link", () => {
-  function buildProvision(port = 0) {
-    const { creds, db } = build();
-    const server = new ProvisionServer(creds, {
-      enabled: true,
-      host: "127.0.0.1",
-      port,
-      base_url: "",
-    });
-    return { creds, db, server };
-  }
-
-  it("a single-use link stores the key and the token cannot be replayed", async () => {
-    const { creds, server } = buildProvision();
-    await server.start();
-    try {
-      const token = creds.createProvisionToken(USER_A);
-      const url = server.linkFor(token);
-      assert.match(url, /^http:\/\/127\.0\.0\.1:\d+\/qoder-key\/[0-9a-f]{48}$/);
-
-      const form = await (await fetch(url)).text();
-      assert.ok(form.includes('type="password"'));
-      assert.ok(form.includes("https://qoder.com/account/integrations"));
-      assert.ok(form.includes("Personal Access Token"));
-      assert.ok(!form.includes(token), "the page must not echo the token");
-
-      const saved = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: `api_key=${encodeURIComponent(KEY_A)}`,
-      });
-      assert.equal(saved.status, 200);
-      assert.equal(creds.status(USER_A), "configured");
-      assert.equal(creds.revealForLaunch(USER_A), KEY_A);
-
-      const replay = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: `api_key=${encodeURIComponent(KEY_B)}`,
-      });
-      assert.equal(replay.status, 400);
-      assert.equal(creds.status(USER_B), "missing");
-    } finally {
-      server.stop();
-    }
-  });
-
-  it("an expired link is refused", async () => {
-    const { creds, db, server } = buildProvision();
-    await server.start();
-    try {
-      const token = creds.createProvisionToken(USER_A);
-      db
-        .raw()
-        .prepare("UPDATE credential_grants SET expires_at = datetime('now','-1 hour')")
-        .run();
-      const res = await fetch(server.linkFor(token), {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: `api_key=${encodeURIComponent(KEY_A)}`,
-      });
-      assert.equal(res.status, 400);
-      assert.equal(creds.status(USER_A), "missing");
-    } finally {
-      server.stop();
-    }
-  });
-
-  it("refuses to serve keys over plain HTTP on a non-loopback bind", async () => {
-    const { creds } = build();
-    const exposed = new ProvisionServer(creds, {
-      enabled: true,
-      host: "0.0.0.0",
-      port: 8799,
-      base_url: "",
-    });
-    await assert.rejects(exposed.start(), /https/);
-    const proxied = new ProvisionServer(creds, {
-      enabled: true,
-      host: "0.0.0.0",
-      port: 8799,
-      base_url: "https://teleops.example.com",
-    });
-    assert.equal(proxied.linkFor("a".repeat(48)), "https://teleops.example.com/qoder-key/" + "a".repeat(48));
-  });
-});
-
 describe("per-user Qoder credentials: Telegram surface", () => {
   interface Ctx {
     from: { id: number };
     chat: { id: number };
+    msg?: { message_id: number };
+    message?: { text: string };
     callbackQuery?: { data: string };
     reply(text: string): Promise<{ message_id: number }>;
     replies: string[];
@@ -520,9 +434,22 @@ describe("per-user Qoder credentials: Telegram surface", () => {
     };
   }
 
-  function buildHarness(
-    provisionFactory?: (creds: CredentialService) => ProvisionServer,
-  ) {
+  interface Harness {
+    db: DB;
+    creds: CredentialService;
+    controller: {
+      qoderKeyCommand(ctx: Ctx): Promise<void>;
+      handleCallback(ctx: Ctx): Promise<void>;
+      textMessage(ctx: Ctx): Promise<void>;
+      requireAdmin(ctx: Ctx): Promise<boolean>;
+      credentialsStatusText(): string;
+      bot: { api: { deleteMessage(chatId: number, messageId: number): Promise<unknown> } };
+      state: Map<number, { pendingKeyEntry?: { promptMsgId: number } }>;
+    };
+    deleted: Array<[number, number]>;
+  }
+
+  function buildHarness(): Harness {
     const config = makeConfig({
       allowed_users: [USER_A, USER_B, ADMIN],
       admin_users: [ADMIN],
@@ -530,47 +457,79 @@ describe("per-user Qoder credentials: Telegram surface", () => {
     const dir = tempDir("teleops-cred-bot-");
     const db = new DB(tempDbFile(dir));
     const creds = new CredentialService(db, new SecretBox(path.join(dir, "teleops.key")));
+    const deleted: Array<[number, number]> = [];
     const app = {
       config,
       db,
       credentials: creds,
-      provision: provisionFactory ? provisionFactory(creds) : null,
+      patValidator: null,
+      logs: { system: { info() {}, warn() {}, error() {} } },
     } as unknown as App;
-    const controller = new TelegramController(app) as unknown as {
-      qoderKeyCommand(ctx: Ctx): Promise<void>;
-      handleCallback(ctx: Ctx): Promise<void>;
-      requireAdmin(ctx: Ctx): Promise<boolean>;
-      credentialsStatusText(): string;
+    const controller = new TelegramController(app) as unknown as Harness["controller"];
+    controller.bot.api.deleteMessage = async (chatId: number, messageId: number) => {
+      deleted.push([chatId, messageId]);
     };
-    return { db, creds, controller };
+    return { db, creds, controller, deleted };
   }
 
-  it("/qoderkey hands out a one-time link and shows status only — never the value", async () => {
-    const { creds, controller } = buildHarness((c) => new ProvisionServer(c, {
-      enabled: true,
-      host: "127.0.0.1",
-      port: 8717,
-      base_url: "",
-    }));
+  it("/qoderkey shows status, the Qoder PAT page and a set-token button — never the value", async () => {
+    const { creds, controller } = buildHarness();
     creds.save(USER_A, KEY_A);
     const ctx = fakeCtx(USER_A);
     await controller.qoderKeyCommand(ctx);
     const text = ctx.replies.join("\n");
     assert.ok(text.includes("Status: configured"));
     assert.ok(text.includes("https://qoder.com/account/integrations"));
-    assert.ok(text.includes("token values are never listed"));
-    assert.match(text, /http:\/\/127\.0\.0\.1:8717\/qoder-key\/[0-9a-f]{48}/);
+    assert.ok(/never listed/i.test(text));
+    assert.ok(!text.includes("qoder-key/"), "no provisioning link may remain");
     assert.ok(!text.includes(KEY_A), "the reply must never contain the key");
   });
 
-  it("/qoderkey with provisioning disabled fails closed instead of asking for a key in chat", async () => {
-    const { controller } = buildHarness();
-    const ctx = fakeCtx(USER_B);
-    await controller.qoderKeyCommand(ctx);
-    const text = ctx.replies.join("\n");
-    assert.ok(text.includes("Status: missing"));
-    assert.ok(text.includes("disabled"));
-    assert.ok(!/paste it here|send me the key/i.test(text));
+  it("keyset + reply stores the token, deletes both messages and never echoes it", async () => {
+    const { creds, controller, deleted } = buildHarness();
+    const tap = fakeCtx(USER_A, "keyset");
+    await controller.handleCallback(tap);
+    assert.ok(tap.replies.join("\n").includes("Send your Qoder token"));
+    assert.ok(controller.state.get(USER_A)?.pendingKeyEntry, "waiting for the reply");
+
+    const msg = fakeCtx(USER_A);
+    msg.msg = { message_id: 77 };
+    msg.message = { text: `  ${KEY_A}  ` };
+    await controller.textMessage(msg);
+
+    assert.equal(creds.status(USER_A), "configured");
+    assert.equal(creds.revealForLaunch(USER_A), KEY_A);
+    assert.ok(!msg.replies.join("\n").includes(KEY_A), "the confirmation must not echo the token");
+    assert.deepEqual(deleted, [
+      [1000 + USER_A, 77],
+      [1000 + USER_A, 1],
+    ]);
+    assert.equal(controller.state.get(USER_A)?.pendingKeyEntry, undefined);
+  });
+
+  it("a malformed reply saves nothing and keeps the flow open", async () => {
+    const { creds, controller, deleted } = buildHarness();
+    const tap = fakeCtx(USER_A, "keyset");
+    await controller.handleCallback(tap);
+
+    const msg = fakeCtx(USER_A);
+    msg.msg = { message_id: 78 };
+    msg.message = { text: "abc" };
+    await controller.textMessage(msg);
+
+    assert.ok(msg.replies.join("\n").includes("doesn't look like a usable token"));
+    assert.equal(creds.status(USER_A), "missing");
+    assert.equal(deleted.length, 0);
+    assert.ok(controller.state.get(USER_A)?.pendingKeyEntry);
+  });
+
+  it("outside the keyset flow a token reply never reaches the credential store", async () => {
+    const { creds, controller } = buildHarness();
+    const msg = fakeCtx(USER_A);
+    msg.message = { text: KEY_A };
+    await controller.textMessage(msg);
+    assert.ok(msg.replies.join("\n").includes("Open a session"));
+    assert.equal(creds.status(USER_A), "missing");
   });
 
   it("deletion needs a confirmed second step and only removes the caller's own key", async () => {

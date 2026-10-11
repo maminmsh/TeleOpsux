@@ -310,42 +310,6 @@ export class DB {
       .all() as Array<{ telegram_user_id: number; key_enc: string }>;
   }
 
-  // ---- credential provisioning grants (single-use, short-lived) ----
-  createCredentialGrant(tokenHash: string, telegramUserId: number, expiresAt: string): void {
-    this.db
-      .prepare(
-        `INSERT INTO credential_grants (token_hash, telegram_user_id, expires_at)
-         VALUES (?, ?, ?)`,
-      )
-      .run(tokenHash, telegramUserId, expiresAt);
-  }
-  getCredentialGrant(tokenHash: string):
-    | { telegram_user_id: number; expires_at: string; used_at: string | null }
-    | undefined {
-    return this.db
-      .prepare(
-        "SELECT telegram_user_id, expires_at, used_at FROM credential_grants WHERE token_hash = ?",
-      )
-      .get(tokenHash) as
-    | { telegram_user_id: number; expires_at: string; used_at: string | null }
-    | undefined;
-  }
-  markCredentialGrantUsed(tokenHash: string): void {
-    this.db
-      .prepare("UPDATE credential_grants SET used_at = datetime('now') WHERE token_hash = ?")
-      .run(tokenHash);
-  }
-  deleteCredentialGrantsForUser(telegramUserId: number): void {
-    this.db
-      .prepare("DELETE FROM credential_grants WHERE telegram_user_id = ?")
-      .run(telegramUserId);
-  }
-  purgeExpiredCredentialGrants(): void {
-    this.db
-      .prepare("DELETE FROM credential_grants WHERE expires_at < datetime('now')")
-      .run();
-  }
-
   // ---- task logs ----
   createTaskLog(t: {
     session_id: number;

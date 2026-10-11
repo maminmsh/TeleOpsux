@@ -104,14 +104,15 @@ describe("ownership migration", () => {
     buildLegacyDb(file);
 
     const db = new DB(file);
-    assert.ok(db.schemaVersion() >= 6);
-    // v6 tables arrive on the upgraded legacy DB (per-user credentials + grants)
+    assert.ok(db.schemaVersion() >= 7);
+    // v6 tables arrive on the upgraded legacy DB (per-user credentials);
+    // v7 removes the provisioning-grant table again
     const tables = db
       .raw()
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
       .all() as Array<{ name: string }>;
     assert.ok(tables.some((t) => t.name === "qoder_credentials"));
-    assert.ok(tables.some((t) => t.name === "credential_grants"));
+    assert.ok(!tables.some((t) => t.name === "credential_grants"));
 
     // original rows survived
     const s = db.getSession(1);

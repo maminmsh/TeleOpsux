@@ -16,7 +16,7 @@ import type { ProjectFiles } from "../session/project-files";
 import type { ServerModeService } from "../server/server-mode";
 import type { FullReport } from "../monitor/remote-monitor";
 import type { CredentialService } from "../credentials/credential-service";
-import type { ProvisionServer } from "../credentials/provision-server";
+import type { PatValidator } from "../credentials/pat-validator";
 import {
   isAdminUser as _isAdminUser,
   isAllowedUser as _isAllowedUser,
@@ -53,8 +53,8 @@ export interface App {
   tracker: ModuleErrorTracker;
   hosts: HostService;
   credentials: CredentialService;
-  /** null when credentials.provision.enabled is false (strict fail-closed). */
-  provision: ProvisionServer | null;
+  /** Optional live "does this PAT work?" probe used by the /qoderkey flow. */
+  patValidator: PatValidator;
   projectFiles: ProjectFiles | null;
   serverMode: ServerModeService;
 }

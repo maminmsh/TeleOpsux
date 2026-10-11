@@ -103,7 +103,7 @@ function buildApp() {
     bus: { on() {}, emit() {} },
     sessions,
     credentials,
-    provision: null,
+    patValidator: null,
     adapters: {
       ids: () => ["shell"],
       get: (id: string) =>

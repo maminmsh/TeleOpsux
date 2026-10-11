@@ -15,8 +15,6 @@ import { HostService } from "./ssh/host-service";
 import { SecretBox } from "./shared/secret-box";
 import { CredentialService } from "./credentials/credential-service";
 import { PatValidator } from "./credentials/pat-validator";
-import { ProvisionServer } from "./credentials/provision-server";
-import { isAllowedUser } from "./auth/access";
 import { LocalRunner } from "./exec/local-runner";
 import { ServerModeService } from "./server/server-mode";
 import { App } from "./core/container";
@@ -35,11 +33,7 @@ async function main(): Promise<void> {
 
   // Per-user Qoder credentials: encrypted at rest, revealed only at launch.
   const credBox = new SecretBox(config.paths.secret_key_file);
-  const credentials = new CredentialService(
-    db,
-    credBox,
-    config.credentials.token_ttl_minutes,
-  );
+  const credentials = new CredentialService(db, credBox);
   // Supported non-destructive check that a submitted PAT actually works, before
   // anything is written: `qoder --list-models` authenticates and exits.
   const qoderAgent = config.agents.qoder ?? { enabled: false, command: "qoder" };
@@ -48,17 +42,6 @@ async function main(): Promise<void> {
     enabled: config.credentials.validate_pat && qoderAgent.enabled,
     timeoutSeconds: config.credentials.pat_validation_timeout_seconds,
   });
-  const provision = config.credentials.provision.enabled
-    ? new ProvisionServer(credentials, config.credentials.provision, {
-        botToken: config.telegram.botToken,
-        isAuthorized: (uid) => isAllowedUser({ config }, uid),
-        validator: patValidator,
-        mini_app_url: config.credentials.mini_app_url,
-        init_data_max_age_seconds: config.credentials.init_data_max_age_seconds,
-        rate_limit: config.credentials.rate_limit,
-        log: { warn: (m) => logs.system.warn(`credential form: ${m}`) },
-      })
-    : null;
 
   // Everything starts on the LOCAL transport; ServerModeService hot-swaps to
   // SSH when an active host exists.
@@ -92,7 +75,7 @@ async function main(): Promise<void> {
     tracker,
     hosts,
     credentials,
-    provision,
+    patValidator,
     projectFiles: null,
     serverMode: null as unknown as ServerModeService, // assigned below
   };
@@ -126,31 +109,6 @@ async function main(): Promise<void> {
   }
 
   notifications.start();
-  if (provision) {
-    try {
-      await provision.start();
-      logs.system.info(`credential provisioning form listening on ${provision.address()}`);
-      const appUrl = provision.miniAppUrl();
-      if (appUrl)
-        logs.system.info(`Qoder Mini App served at ${appUrl} (Telegram button enabled)`);
-      else if (config.credentials.mini_app_url)
-        logs.system.warn(
-          `TELEOPS_MINI_APP_URL is not a usable https:// URL ("${config.credentials.mini_app_url}") — ` +
-            "the bot falls back to single-use links until TLS is in place.",
-        );
-    } catch (e) {
-      tracker.report("credentials", e, { step: "provision_start" });
-      logs.system.warn(
-        "credential provisioning form is NOT running — users cannot store a Qoder key " +
-          "until this is fixed (Qoder sessions stay blocked for them).",
-      );
-    }
-  } else {
-    logs.system.warn(
-      "credentials.provision.enabled=false — Qoder sessions require a credential stored " +
-        "through another secure path; users have no self-service way to provide one.",
-    );
-  }
   app.serverMode.ensureMonitorRunning();
 
   let telegram: TelegramController | null = null;
@@ -178,7 +136,6 @@ async function main(): Promise<void> {
     try {
       app.monitor.stop();
       app.serverMode.connection?.close();
-      provision?.stop();
       sessions.shutdown();
       if (telegram) await telegram.stop();
       logs.system.info("telegram bot stopped");

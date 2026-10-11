@@ -129,6 +129,19 @@ CREATE INDEX IF NOT EXISTS idx_credential_grants_expiry ON credential_grants(exp
 `);
     },
   },
+  {
+    version: 7,
+    name: "drop credential provisioning grants",
+    up: (db) => {
+      // Mini App / one-time-link provisioning was removed — the token now
+      // enters through the /qoderkey chat flow, so grant rows are dead weight.
+      db.exec(`
+DROP INDEX IF EXISTS idx_credential_grants_user;
+DROP INDEX IF EXISTS idx_credential_grants_expiry;
+DROP TABLE IF EXISTS credential_grants;
+`);
+    },
+  },
 ];
 
 function addColumn(

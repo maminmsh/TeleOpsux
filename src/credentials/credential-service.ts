@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import type { DB } from "../db/database";
 import type { CredentialStatus } from "../shared/types";
 import type { SecretBox } from "../shared/secret-box";
@@ -18,12 +17,13 @@ export class CredentialRequiredError extends Error {
 }
 
 /**
- * Refused input: Telegram messages persist, can be forwarded and cannot be
- * reliably deleted, so a credential is never accepted through chat.
+ * Refused input: outside the dedicated /qoderkey entry flow a token must never
+ * appear in chat history, task text or session input (messages persist and can
+ * be forwarded).
  */
 export const CREDENTIAL_IN_CHAT_MESSAGE =
   "⛔ API keys are never accepted in chat, task text or session input. " +
-  "Run /qoderkey and enter the credential in the secure setup form.";
+  "Run /qoderkey and use \u201cSet token\u201d to store your credential.";
 
 /**
  * Per-user Qoder credentials, keyed by TELEGRAM USER ID (never session id):
@@ -37,14 +37,13 @@ export const CREDENTIAL_IN_CHAT_MESSAGE =
  *    transiently for output redaction — never returned to UI layers;
  *  - no fallback to a server-wide API key or shared qoder login: if the user
  *    has no credential, status is "missing" and the caller must fail closed;
- *  - provisioning never happens in Telegram chat (single-use token links, see
- *    provision-server.ts); admins see statuses only.
+ *  - the token enters through the /qoderkey chat flow only (the bot deletes
+ *    the messages right after saving); admins see statuses only.
  */
 export class CredentialService {
   constructor(
     private db: DB,
     private box: SecretBox,
-    private tokenTtlMinutes = 10,
   ) {}
 
   /** "missing" = no stored row. Never exposes any part of the value. */
@@ -60,9 +59,8 @@ export class CredentialService {
   }
 
   /**
-   * Shape checks shared by every entry point (Mini App API, one-time form).
-   * Returns the trimmed credential or null when it is unusable — never throws,
-   * never echoes the value.
+   * Shape checks for every entry point. Returns the trimmed credential or
+   * null when it is unusable — never throws, never echoes the value.
    */
   normalizeKey(raw: unknown): string | null {
     if (typeof raw !== "string") return null;
@@ -77,13 +75,11 @@ export class CredentialService {
   save(telegramUserId: number, plainKey: string): void {
     const key = this.normalizeKey(plainKey);
     if (key === null) throw new Error("credential must be 8–512 characters without control characters");
-    this.db.purgeExpiredCredentialGrants();
     this.db.upsertQoderCredential(telegramUserId, this.box.encrypt(key));
   }
 
   remove(telegramUserId: number): void {
     this.db.deleteQoderCredential(telegramUserId);
-    this.db.deleteCredentialGrantsForUser(telegramUserId);
   }
 
   /** Mark broken WITHOUT ever logging or echoing the value. */
@@ -132,8 +128,8 @@ export class CredentialService {
 
   /**
    * True when the text contains a stored credential of ANY user. Used to refuse
-   * chat/task input: a key must never be typed into Telegram, because chat
-   * messages persist, can be forwarded and cannot be reliably deleted.
+   * chat/task/session input outside the /qoderkey entry flow, so a key never
+   * lands in history, task text or an agent pane.
    */
   containsStoredSecret(text: string): boolean {
     for (const row of this.db.listCredentialKeyBlobs()) {
@@ -145,35 +141,6 @@ export class CredentialService {
       }
     }
     return false;
-  }
-
-  /** Single-use provisioning token; raw value goes ONLY into the link. */
-  createProvisionToken(telegramUserId: number): string {
-    this.db.purgeExpiredCredentialGrants();
-    const token = crypto.randomBytes(24).toString("hex");
-    const hash = this.hashToken(token);
-    const expiresAt = new Date(Date.now() + this.tokenTtlMinutes * 60_000)
-      .toISOString()
-      .replace("T", " ")
-      .slice(0, 19);
-    this.db.createCredentialGrant(hash, telegramUserId, expiresAt);
-    return token;
-  }
-
-  /** Returns the owning user id on success; null on invalid/expired/used. */
-  consumeProvisionToken(token: string): number | null {
-    const hash = this.hashToken(token);
-    const grant = this.db.getCredentialGrant(hash);
-    if (!grant || grant.used_at) return null;
-    // compare via the hash lookup itself (random 48-hex ids are not enumerable)
-    const expiresMs = Date.parse(grant.expires_at.replace(" ", "T") + "Z");
-    if (!Number.isFinite(expiresMs) || Date.now() > expiresMs) return null;
-    this.db.markCredentialGrantUsed(hash);
-    return grant.telegram_user_id;
-  }
-
-  private hashToken(token: string): string {
-    return crypto.createHash("sha256").update(token).digest("hex");
   }
 
   /** Admin-visible listing — statuses only, never key material. */
