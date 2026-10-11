@@ -4,6 +4,13 @@ export interface ExecOptions {
   /** Written to the child/channel stdin, then EOF. */
   input?: string;
   maxBuffer?: number;
+  /**
+   * Extra environment for the child. A value of `undefined` REMOVES the
+   * variable from the inherited environment — this is how a secret is kept out
+   * of an argv list without ever being inherited from the parent process.
+   * Local transport only; SSH does not forward arbitrary env.
+   */
+  env?: Record<string, string | undefined>;
 }
 
 export interface ExecResult {

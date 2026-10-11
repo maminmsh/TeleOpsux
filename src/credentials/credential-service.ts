@@ -23,7 +23,7 @@ export class CredentialRequiredError extends Error {
  */
 export const CREDENTIAL_IN_CHAT_MESSAGE =
   "⛔ API keys are never accepted in chat, task text or session input. " +
-  "Run /qoderkey to store the credential on a single-use secure link.";
+  "Run /qoderkey and enter the credential in the secure setup form.";
 
 /**
  * Per-user Qoder credentials, keyed by TELEGRAM USER ID (never session id):
@@ -59,14 +59,24 @@ export class CredentialService {
     return this.status(telegramUserId) === "configured";
   }
 
+  /**
+   * Shape checks shared by every entry point (Mini App API, one-time form).
+   * Returns the trimmed credential or null when it is unusable — never throws,
+   * never echoes the value.
+   */
+  normalizeKey(raw: unknown): string | null {
+    if (typeof raw !== "string") return null;
+    const key = raw.trim();
+    if (key.length < 8 || key.length > 512) return null;
+    // control chars (incl. CR/LF) would break shell env injection
+    if (/[\u0000-\u001f\u007f]/.test(key)) return null;
+    return key;
+  }
+
   /** Basic shape check; rejects whitespace/control chars that would break shell env. */
   save(telegramUserId: number, plainKey: string): void {
-    const key = plainKey.trim();
-    if (key.length < 8 || key.length > 512)
-      throw new Error("credential must be 8–512 characters");
-    // control chars (incl. CR/LF) would break shell env injection
-    if (/[\u0000-\u001f\u007f]/.test(key))
-      throw new Error("credential contains control characters");
+    const key = this.normalizeKey(plainKey);
+    if (key === null) throw new Error("credential must be 8–512 characters without control characters");
     this.db.purgeExpiredCredentialGrants();
     this.db.upsertQoderCredential(telegramUserId, this.box.encrypt(key));
   }

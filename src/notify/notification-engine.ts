@@ -52,7 +52,7 @@ export class NotificationEngine {
       case "CREDENTIAL_INVALID":
         return (
           `🔑 Your ${String(p.agent ?? "agent")} credential was rejected (status: invalid).\n` +
-          "Run /qoderkey to store a new one through the single-use secure link."
+          "Run /qoderkey and enter a new one in the secure setup form."
         );
       case "SERVER_LOW_MEMORY":
         return `🚨 SERVER: RAM ${p.value}%`;

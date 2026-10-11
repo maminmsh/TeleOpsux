@@ -65,10 +65,14 @@ src/
   policy/         Policy Engine (allow / approval / deny)
   approval/       Approval Manager (requests, handlers, expiry)
   notify/         Notification Engine (rules -> sink) + per-owner routing
-  credentials/    per-user API keys: encrypted store + one-time provisioning form
+  credentials/    per-user API keys: encrypted store, Telegram Mini App + initData
+                  validation, one-time provisioning form, PAT probe, rate limits
   telegram/       Telegram view layer (commands, menus, chat, live output)
   main.ts         composition root
-test/             node:test suites (access, migration, routing, bot authz, credentials)
+test/             node:test suites (access, migration, routing, bot authz,
+                  credentials, Mini App)
+scripts/          smoke/e2e helpers + teleops.service + check-miniapp.ts
+deploy/           teleops-qoder-minapp.nginx.conf (template — NOT applied)
 config/config.example.yaml
 .env.example
 ```
@@ -93,6 +97,10 @@ npm install
 # 2. configure secrets
 cp .env.example .env
 #   -> set TELEGRAM_BOT_TOKEN
+#   -> TELEOPS_SECRET_KEY_FILE is the AES key for stored credentials (keep it
+#      outside the repo and back it up separately)
+#   -> TELEOPS_MINI_APP_URL is optional: without an https:// URL /qoderkey
+#      falls back to single-use localhost links (see "Connect Qoder")
 
 # 3. configure the control plane
 mkdir -p config
@@ -217,12 +225,13 @@ passwords). Statuses are `configured` / `invalid`; *missing* means no row.
 tokens with an expiry.
 
 **Provisioning — a key is never accepted in chat.** Telegram messages persist,
-can be forwarded and cannot be reliably deleted, so `/qoderkey` hands out a
-one-time link (`credentials.provision`) to a minimal form page; the value is
-POSTed there, encrypted, and only the success/failure status returns to the
-chat. Links expire after `token_ttl_minutes` (default 10) and are marked used on
-first submit. `sendInput`/task text are additionally refused if they contain any
-stored key.
+can be forwarded and cannot be reliably deleted, so a credential is entered only
+in a secure form: `/qoderkey` opens the **Connect Qoder** Mini App (see below)
+or, when no HTTPS origin is configured, hands out a one-time link to a minimal
+form page (`credentials.provision`). The value is POSTed there, encrypted, and
+only the status returns to the chat. Links expire after `token_ttl_minutes`
+(default 10) and are marked used on first submit. `sendInput`/task text are
+additionally refused if they contain any stored key.
 
 **Launch injection** (`SessionManager.start`): the key is written through the
 runner's *stdin* into `$HOME/.teleops-credentials/teleops-session-<id>.key`
@@ -244,6 +253,107 @@ proxy, set `credentials.provision.base_url` to the `https://` origin. The server
 Set `enabled: false` for strict fail-closed deployments (no self-service path at
 all — Qoder stays blocked until a credential is provisioned out of band).
 
+### Connect Qoder — the Telegram Mini App
+
+`/qoderkey` shows an **Open Secure Qoder Setup** button that opens
+`TELEOPS_MINI_APP_URL` (e.g. `https://your-host/qoder-key/app`) inside Telegram.
+The form is one static HTML document (`src/credentials/mini-app-page.ts`) with no
+framework, no external script, no analytics and no storage of any kind: the token
+is typed into a password field, POSTed once as JSON over HTTPS, and wiped from the
+field. It follows Telegram's light/dark theme, has show/hide, loading, success and
+error states, a Cancel/close action, and cannot be submitted twice concurrently.
+
+**The server never trusts the client** (`src/credentials/telegram-init-data.ts`):
+
+1. the page reads `initData` (from `Telegram.WebApp` or the launch fragment) and
+   sends it in the `X-Telegram-Init-Data` **header** — never in a URL, body field
+   or callback;
+2. the backend recomputes Telegram's HMAC (`sha256(bot_token)` → `WebAppData` →
+   sorted `key=value` pairs) and compares it **constant-time**; the signing key is
+   derived from *our* bot token, so another bot's initData cannot pass;
+3. `auth_date` must fall inside `credentials.init_data_max_age_seconds`
+   (default 3600, clock skew ≤ 60 s) — expired or future-dated data is refused;
+4. only then is the user id read out of the verified payload, and it must appear
+   in `security.allowed_users`; anyone else gets the standard
+   `⛔ You do not have access to this resource.`;
+5. `initDataUnsafe` is never used, and the bot token is never sent to the client.
+
+Malformed / missing / unauthenticated data → `401`, unknown user → `403`, bad
+token shape → `400`, non-JSON or oversized body → `415`, Qoder refusing the token
+→ `422` (and nothing is stored). Responses carry only a status and a safe message
+— never the value, never the ciphertext.
+
+**Rate limiting** (`credentials.rate_limit`): failed authentications cost 3× a
+normal attempt per client address, and accepted writes are capped per Telegram
+user, both in a sliding window. `X-Forwarded-For` is only honoured when
+`credentials.provision.trust_proxy: true` *and* the packet really came from a
+loopback peer, so a browser cannot pick its own bucket.
+
+**The token is verified before it is stored** (`src/credentials/pat-validator.ts`):
+the supported, non-destructive CLI check — `qoder --list-models` — authenticates
+and exits without starting a session or spending completion tokens. The PAT is
+passed to that child **through its environment only** (never argv), with
+`HOME`/`--config-dir` pointed at a private 0700 scratch directory that is deleted
+afterwards, so no other login can mask or be replaced by it. `QODER_API_KEY` is
+explicitly unset for the probe. A rejected token is reported and not persisted; if
+the probe cannot run (CLI missing, timeout, network) the credential is still
+stored but the answer says *"could not verify"* rather than pretending success.
+Turn it off with `credentials.validate_pat: false`.
+
+### Getting a valid HTTPS URL (required by Telegram)
+
+The credential server keeps listening on `127.0.0.1:8717`; **nothing else is
+exposed**. Choose in this order:
+
+1. **Reuse an existing HTTPS hostname** — add the `location /qoder-key/` block
+   from `deploy/teleops-qoder-minapp.nginx.conf` to the server that already
+   terminates TLS on 443, then set
+   `TELEOPS_MINI_APP_URL=https://that-host/qoder-key/app`.
+2. **A certificate for your own (sub)domain** — `certbot --nginx -d teleops.example.com`
+   (automated renewal, and it does not disturb whatever else shares port 443 —
+   prefer this over a certificate for a bare public IP).
+3. **A temporary tunnel** (cloudflared / ngrok) for testing only: it is somebody
+   else's server sitting on your credentials, so remove it before real use.
+
+Then, as root (inspect first, this file is only a template):
+
+```bash
+sudo cp deploy/teleops-qoder-minapp.nginx.conf /etc/nginx/snippets/teleops-qoder-minapp.conf
+sudo nginx -t && sudo systemctl reload nginx     # validate before reloading
+TELEOPS_MINI_APP_URL=https://teleops.example.com/qoder-key/app npm run check:miniapp
+```
+
+`npm run check:miniapp` is read-only: it reports whether the origin is HTTPS, the
+certificate is trusted and unexpired, `/qoder-key/healthz` answers, the page is
+served with a `no-store` + strict CSP and no third-party script, and that an
+unauthenticated credential write is refused. Exit 0 means the button really works;
+until it does, do not describe the Mini App as live.
+
+**Restarting:** the Mini App is part of the TeleOps process — there is no second
+service to manage. `sudo systemctl restart teleops` (unit in
+`scripts/teleops.service`), or `npm run dev` / `npm start` if you run it by hand;
+`node dist/main.js` needs `npm run build` first. Check `logs/system.log` for
+`Qoder Mini App served at …` — the startup line never contains a credential.
+
+**Key rotation** (`data/teleops.key`, 0600, outside git). Rotate the
+`TELEOPS_SECRET_KEY_FILE` by re-encrypting in one controlled pass, because
+existing rows would otherwise decrypt as garbage and be flipped to `invalid`:
+
+```bash
+cp data/teleops.key data/teleops.key.bak.$(date +%F)   # rollback = restore this
+# 1) decrypt everything with the OLD key, 2) write the new 32-byte hex key,
+# 3) re-encrypt qoder_credentials.key_enc and ssh_hosts.password_enc with it.
+shred -u data/teleops.key.bak.<date>                   # after a verified restart
+```
+Users must run `/qoderkey` again only if a row cannot be re-encrypted; the status
+(`invalid`) tells them and the admin so.
+
+**Revocation:** the user taps "Delete my credential" in `/qoderkey` (two taps), or
+an operator deletes the row (`DELETE FROM qoder_credentials WHERE telegram_user_id=…`).
+Running sessions keep the key they were launched with; the next launch is blocked
+until a new credential is provided. Revoke the token itself at
+<https://qoder.com/account/integrations> — TeleOps cannot revoke it server-side.
+
 **Deletion:** `/qoderkey` → "Delete my credential" requires a second
 confirmation tap (the confirmation must exist in server-side state, so replayed
 callback data alone cannot delete anything). Deleting one user's key never
@@ -252,8 +362,10 @@ touches another user's sessions. Admins see statuses only (`/credentials`).
 ## Tests
 
 ```bash
-npm test          # node:test + tsx — access, migration, routing, bot authz, credentials
+npm test          # node:test + tsx — access, migration, routing, bot authz, credentials, Mini App
 npm run typecheck
+npm run build
+npm run check:miniapp   # read-only reachability check of the public HTTPS URL
 ```
 
 `test/credentials.test.ts` proves the isolation contract: A's session gets
@@ -262,6 +374,14 @@ Qoder session while unprovisioned even though A is, a server-wide
 `QODER_PERSONAL_ACCESS_TOKEN` (or the legacy `QODER_API_KEY`) is never inherited, the plaintext never appears in a command
 line / pane / capture / history / DB file, output is scrubbed, provisioning
 links are single-use, and deletion is confirmed and per-user.
+
+`test/mini-app.test.ts` covers the Mini App path with dummy tokens only: signed
+vs forged vs expired vs malformed `initData`, an unauthorized Telegram user
+(standard `⛔` reply), A replacing only A's credential under 6 concurrent
+cross-user posts, encryption/decryption round-trip, revocation, the PAT
+appearing nowhere on disk or in any warning line, validation-before-storage,
+rate limiting (including a spoofed `X-Forwarded-For`), the `web_app` button and
+its localhost fallback, and the legacy one-time-token link.
 
 ---
 

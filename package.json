@@ -12,7 +12,8 @@
     "dev": "tsx watch src/main.ts",
     "db:migrate": "tsx src/db/cli.ts migrate",
     "test": "node --import tsx --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:miniapp": "tsx scripts/check-miniapp.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.5.0",

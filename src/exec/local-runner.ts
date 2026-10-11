@@ -2,6 +2,23 @@ import { spawn } from "node:child_process";
 import type { ExecOptions, ExecResult, ExecRunner } from "./exec-runner";
 
 /**
+ * Build the child environment: inherit ours, then apply overrides. A value of
+ * `undefined` deletes the variable, so a secret can be injected for exactly one
+ * child without ever appearing in argv or in the parent's environment.
+ */
+function childEnv(
+  overrides: ExecOptions["env"],
+): NodeJS.ProcessEnv | undefined {
+  if (!overrides) return process.env;
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+  return env;
+}
+
+/**
  * Local runner based on spawn with an argv array (never a shell string for
  * exec()) and stdin support via the `input` option.
  */
@@ -14,7 +31,7 @@ export class LocalRunner implements ExecRunner {
     return new Promise((resolve) => {
       let child: ReturnType<typeof spawn>;
       try {
-        child = spawn(cmd, args, { cwd: opts?.cwd });
+        child = spawn(cmd, args, { cwd: opts?.cwd, env: childEnv(opts?.env) });
       } catch (e) {
         resolve({ code: null, stdout: "", stderr: (e as Error).message });
         return;

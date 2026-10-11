@@ -54,6 +54,26 @@ export interface Config {
     /** One-time provisioning links expire after this many minutes. */
     token_ttl_minutes: number;
     /**
+     * Full https:// URL of the Telegram Mini App (env TELEOPS_MINI_APP_URL).
+     * Telegram only accepts a valid HTTPS origin, so this is also the switch
+     * for the "Open Secure Qoder Setup" button: without it the bot hands out a
+     * single-use localhost link instead (reached through an SSH tunnel).
+     */
+    mini_app_url: string;
+    /** initData older than this is refused (seconds). */
+    init_data_max_age_seconds: number;
+    /** Ask Qoder whether the token works BEFORE storing it. */
+    validate_pat: boolean;
+    pat_validation_timeout_seconds: number;
+    /** Sliding-window limits on the credential endpoint. */
+    rate_limit: {
+      window_seconds: number;
+      /** Failed authentications per client address per window. */
+      max_auth_attempts_per_ip: number;
+      /** Accepted credential writes per Telegram user per window. */
+      max_submissions_per_user: number;
+    };
+    /**
      * Local HTTP form server used to collect API keys OUT of Telegram chat.
      * bind host defaults to 127.0.0.1 (browser "secure context" locally; a
      * remote user reaches it through an SSH tunnel). Set base_url to a
@@ -64,6 +84,12 @@ export interface Config {
       host: string;
       port: number;
       base_url: string;
+      /**
+       * Behind a loopback reverse proxy the TCP peer is always 127.0.0.1, so
+       * per-IP limits are meaningless unless the proxy's X-Forwarded-For is
+       * trusted. Enable only when the traffic really comes from a local proxy.
+       */
+      trust_proxy: boolean;
     };
   };
   paths: {
@@ -120,7 +146,22 @@ const DEFAULTS: Config = {
   },
   credentials: {
     token_ttl_minutes: 10,
-    provision: { enabled: true, host: "127.0.0.1", port: 8717, base_url: "" },
+    mini_app_url: "",
+    init_data_max_age_seconds: 3600,
+    validate_pat: true,
+    pat_validation_timeout_seconds: 25,
+    rate_limit: {
+      window_seconds: 900,
+      max_auth_attempts_per_ip: 10,
+      max_submissions_per_user: 8,
+    },
+    provision: {
+      enabled: true,
+      host: "127.0.0.1",
+      port: 8717,
+      base_url: "",
+      trust_proxy: false,
+    },
   },
   paths: {
     database_file: "./data/teleops.db",
@@ -171,6 +212,10 @@ export function loadConfig(configFile?: string): Config {
   merged.paths.log_root = process.env.LOG_ROOT ?? merged.paths.log_root;
   merged.paths.secret_key_file =
     process.env.TELEOPS_SECRET_KEY_FILE ?? merged.paths.secret_key_file;
+  // The Mini App address is deployment state, not project config — it differs
+  // per host and is what an operator rotates when putting TLS in front.
+  merged.credentials.mini_app_url =
+    process.env.TELEOPS_MINI_APP_URL ?? merged.credentials.mini_app_url;
 
   return merged;
 }

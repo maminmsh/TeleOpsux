@@ -621,7 +621,7 @@ export class TelegramController {
           "/summary <id>    rule-based summary",
           "/git <id>        git status for a session",
           "/logs [id] [limit]  task logs of your sessions",
-          "/qoderkey      status of YOUR Qoder credential + a single-use secure link",
+          "/qoderkey      status of YOUR Qoder credential + the secure setup form",
           "                 (never paste an API key into this chat)",
           "/memory [project id] recent tasks memory",
           "/cancel          abort the current wizard",
@@ -1234,7 +1234,7 @@ export class TelegramController {
     ) {
       await ctx.reply(
         CREDENTIAL_REQUIRED_MESSAGE +
-          "\n\nRun /qoderkey for a single-use secure link. " +
+          "\n\nRun /qoderkey and open the secure setup form. " +
           "Your task text is kept — send it again after provisioning.",
       );
       return;
@@ -1346,9 +1346,10 @@ export class TelegramController {
 
   // ---------- per-user Qoder credential ----------
   /**
-   * /qoderkey — issue a single-use provisioning link. The key itself is NEVER
-   * accepted in chat: Telegram messages persist, can be forwarded and cannot be
-   * reliably deleted. Only the status (configured/missing/invalid) is shown.
+   * /qoderkey — the credential itself is NEVER accepted in chat: Telegram
+   * messages persist, can be forwarded and cannot be reliably deleted. Either a
+   * Mini App button (validated initData over HTTPS) or a single-use link is
+   * offered, and only the status (configured/missing/invalid) is shown here.
    */
   private async qoderKeyCommand(ctx: Context): Promise<void> {
     const uid = ctx.from!.id;
@@ -1368,7 +1369,19 @@ export class TelegramController {
       "TeleOps keeps one encrypted Qoder CLI credential for your account; token values are never listed.",
     ];
     const kb = new InlineKeyboard();
-    if (!provision) {
+    const appUrl = provision?.miniAppUrl() ?? null;
+    if (appUrl) {
+      // Telegram Mini App: the token travels once, over HTTPS, straight from the
+      // form to the backend — never through chat, a URL or callback data.
+      lines.push(
+        "",
+        "Tap the button to open the secure form inside Telegram. It authenticates your",
+        "Telegram account, submits the token once over HTTPS and forgets it immediately.",
+        "",
+        "Do NOT paste the token into this chat — it would be stored in history.",
+      );
+      kb.webApp("🔐 Open Secure Qoder Setup", appUrl).row();
+    } else if (!provision) {
       lines.push(
         "",
         "⚠️ Self-service provisioning is disabled on this deployment " +
@@ -1376,6 +1389,11 @@ export class TelegramController {
           "through a secure path.",
       );
     } else {
+      lines.push(
+        "",
+        "⚠️ No HTTPS Mini App is configured on this deployment " +
+          "(TELEOPS_MINI_APP_URL), so provisioning falls back to a single-use link.",
+      );
       const token = this.app.credentials.createProvisionToken(uid);
       lines.push(
         "",
@@ -1386,8 +1404,8 @@ export class TelegramController {
         "",
         "Do NOT paste the key into this chat — it would be stored in history.",
       );
-      if (status !== "missing") kb.text("🗑 Delete my credential", "keydel").row();
     }
+    if (status !== "missing") kb.text("🗑 Delete my credential", "keydel").row();
     kb.text("⬅ Back", "menu:main");
     await ctx.reply(lines.join("\n"), { reply_markup: kb });
   }
@@ -1775,7 +1793,7 @@ export class TelegramController {
       { command: "send", description: "Send a message to a session: /send <id> <text>" },
       { command: "qoder", description: "Send raw Qoder input: /qoder <id> <input>" },
       { command: "history", description: "Session history: /history <id> [limit]" },
-      { command: "qoderkey", description: "Store my Qoder credential via a one-time secure link" },
+      { command: "qoderkey", description: "Store my Qoder credential in a secure form" },
       { command: "logs", description: "Task logs: /logs [session id] [limit]" },
       { command: "git", description: "Git status for a session" },
       { command: "memory", description: "Recent tasks memory of a project" },

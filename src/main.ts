@@ -14,7 +14,9 @@ import { ModuleErrorTracker } from "./core/error-tracker";
 import { HostService } from "./ssh/host-service";
 import { SecretBox } from "./shared/secret-box";
 import { CredentialService } from "./credentials/credential-service";
+import { PatValidator } from "./credentials/pat-validator";
 import { ProvisionServer } from "./credentials/provision-server";
+import { isAllowedUser } from "./auth/access";
 import { LocalRunner } from "./exec/local-runner";
 import { ServerModeService } from "./server/server-mode";
 import { App } from "./core/container";
@@ -38,8 +40,24 @@ async function main(): Promise<void> {
     credBox,
     config.credentials.token_ttl_minutes,
   );
+  // Supported non-destructive check that a submitted PAT actually works, before
+  // anything is written: `qoder --list-models` authenticates and exits.
+  const qoderAgent = config.agents.qoder ?? { enabled: false, command: "qoder" };
+  const patValidator = new PatValidator({
+    command: qoderAgent.command,
+    enabled: config.credentials.validate_pat && qoderAgent.enabled,
+    timeoutSeconds: config.credentials.pat_validation_timeout_seconds,
+  });
   const provision = config.credentials.provision.enabled
-    ? new ProvisionServer(credentials, config.credentials.provision)
+    ? new ProvisionServer(credentials, config.credentials.provision, {
+        botToken: config.telegram.botToken,
+        isAuthorized: (uid) => isAllowedUser({ config }, uid),
+        validator: patValidator,
+        mini_app_url: config.credentials.mini_app_url,
+        init_data_max_age_seconds: config.credentials.init_data_max_age_seconds,
+        rate_limit: config.credentials.rate_limit,
+        log: { warn: (m) => logs.system.warn(`credential form: ${m}`) },
+      })
     : null;
 
   // Everything starts on the LOCAL transport; ServerModeService hot-swaps to
@@ -112,6 +130,14 @@ async function main(): Promise<void> {
     try {
       await provision.start();
       logs.system.info(`credential provisioning form listening on ${provision.address()}`);
+      const appUrl = provision.miniAppUrl();
+      if (appUrl)
+        logs.system.info(`Qoder Mini App served at ${appUrl} (Telegram button enabled)`);
+      else if (config.credentials.mini_app_url)
+        logs.system.warn(
+          `TELEOPS_MINI_APP_URL is not a usable https:// URL ("${config.credentials.mini_app_url}") — ` +
+            "the bot falls back to single-use links until TLS is in place.",
+        );
     } catch (e) {
       tracker.report("credentials", e, { step: "provision_start" });
       logs.system.warn(
