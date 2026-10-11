@@ -1,0 +1,16 @@
+[Unit]
+Description=TeleOps AI Command Center
+After=network.target
+
+[Service]
+Type=simple
+User=amin
+WorkingDirectory=/home/amin/project/project with AI/TeleOps
+# Keep the bot token in an env file with 0600 perms, not in this unit.
+EnvironmentFile=/home/amin/project/project with AI/TeleOps/.env
+ExecStart=/usr/bin/node dist/main.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(which tmux && tmux -V; which qoder codex; node -v)"
+    ]
+  }
+}

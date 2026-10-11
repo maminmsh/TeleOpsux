@@ -1,0 +1,79 @@
+# AI Command Center (TeleOps) configuration
+# Copy to config/config.yaml and adjust. Secrets stay in .env.
+
+telegram:
+  enabled: true
+
+sessions:
+  max_concurrent: 8
+  heartbeat_interval_seconds: 5
+  idle_no_output_seconds: 90   # if a WORKING session goes silent this long, flag it
+  reconnect: true
+  tmux_prefix: teleops         # tmux session names are prefixed with this
+
+security:
+  # Telegram user IDs allowed to use the control center.
+  allowed_users:
+    - 000000000
+  # Absolute project roots the control center may operate in. Empty = use defaults below.
+  project_roots: []
+
+agents:
+  qoder:
+    enabled: true
+    command: qoder
+  codex:
+    enabled: false
+    command: codex
+  shell:
+    enabled: true
+    command: bash
+
+monitor:
+  interval_seconds: 30
+  cpu_warning: 80
+  cpu_critical: 95
+  ram_warning: 80
+  ram_critical: 90
+  disk_warning: 80
+  disk_critical: 90
+  load_enabled: true
+
+policy:
+  # Commands the agent/git layer may run without approval.
+  allowed:
+    - git status
+    - git diff
+    - git log
+    - git branch
+    - npm test
+    - pnpm test
+    - npm run build
+  # Commands that always require user approval.
+  approval_required:
+    - git push
+    - git commit
+    - docker compose down
+    - systemctl restart
+    - rm
+    - sudo
+
+notifications:
+  # Which events should send a Telegram notification.
+  rules:
+    APPROVAL_REQUIRED: telegram_notify
+    USER_INPUT_REQUIRED: telegram_notify
+    COMMAND_FAILED: telegram_notify
+    PROCESS_CRASHED: telegram_notify
+    SESSION_FINISHED: telegram_notify
+    SERVER_LOW_MEMORY: telegram_notify
+    SERVER_HIGH_DISK_USAGE: telegram_notify
+
+# Remote server (SSH) — added at runtime via /addserver; these are connection tuning knobs.
+ssh:
+  exec_timeout_seconds: 20
+  ready_timeout_seconds: 15
+  keepalive_seconds: 15
+
+paths:
+  secret_key_file: ./data/teleops.key

@@ -1,0 +1,56 @@
+import { Config } from "../config/config";
+import { DB } from "../db/database";
+import { EventBus } from "../core/event-bus";
+import { LogHub } from "../logger/logger";
+import { SessionManager } from "../session/session-manager";
+import { AdapterRegistry } from "../adapters/registry";
+import { GitManager } from "../git/git-manager";
+import { ServerMetrics, ProcessInfo } from "../monitor/server-monitor";
+import { ApprovalManager } from "../approval/approval-manager";
+import { PolicyEngine } from "../policy/policy-engine";
+import { NotificationEngine } from "../notify/notification-engine";
+import type { ExecRunner } from "../exec/exec-runner";
+import type { ModuleErrorTracker } from "./error-tracker";
+import type { HostService } from "../ssh/host-service";
+import type { ProjectFiles } from "../session/project-files";
+import type { ServerModeService } from "../server/server-mode";
+import type { FullReport } from "../monitor/remote-monitor";
+
+/** Common surface of the local and remote monitors. */
+export interface MonitorLike {
+  metrics(): Promise<ServerMetrics>;
+  topProcesses(n?: number): Promise<ProcessInfo[]>;
+  /** Only the remote monitor can produce the extended report. */
+  fullReport?(): Promise<FullReport>;
+  start(): void;
+  stop(): void;
+}
+
+/**
+ * Everything the UI / API layers can talk to. Core has no Telegram imports.
+ * runner/git/monitor/projectFiles are mutable: ServerModeService hot-swaps
+ * them when the active SSH host changes.
+ */
+export interface App {
+  config: Config;
+  db: DB;
+  bus: EventBus;
+  logs: LogHub;
+  sessions: SessionManager;
+  adapters: AdapterRegistry;
+  git: GitManager;
+  monitor: MonitorLike;
+  approvals: ApprovalManager;
+  policy: PolicyEngine;
+  notifications: NotificationEngine;
+  runner: ExecRunner;
+  tracker: ModuleErrorTracker;
+  hosts: HostService;
+  projectFiles: ProjectFiles | null;
+  serverMode: ServerModeService;
+}
+
+export function isAllowedUser(app: App, userId: number | undefined): boolean {
+  if (userId == null) return false;
+  return app.config.security.allowed_users.includes(userId);
+}
