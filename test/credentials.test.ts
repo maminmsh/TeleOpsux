@@ -432,6 +432,8 @@ describe("per-user Qoder credentials: provisioning link", () => {
 
       const form = await (await fetch(url)).text();
       assert.ok(form.includes('type="password"'));
+      assert.ok(form.includes("https://qoder.com/account/integrations"));
+      assert.ok(form.includes("Personal Access Token"));
       assert.ok(!form.includes(token), "the page must not echo the token");
 
       const saved = await fetch(url, {
@@ -555,6 +557,8 @@ describe("per-user Qoder credentials: Telegram surface", () => {
     await controller.qoderKeyCommand(ctx);
     const text = ctx.replies.join("\n");
     assert.ok(text.includes("Status: configured"));
+    assert.ok(text.includes("https://qoder.com/account/integrations"));
+    assert.ok(text.includes("token values are never listed"));
     assert.match(text, /http:\/\/127\.0\.0\.1:8717\/qoder-key\/[0-9a-f]{48}/);
     assert.ok(!text.includes(KEY_A), "the reply must never contain the key");
   });

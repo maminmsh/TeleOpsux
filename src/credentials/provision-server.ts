@@ -6,7 +6,8 @@ const MAX_BODY_BYTES = 16 * 1024;
 const PATH_RE = /^\/qoder-key\/([0-9a-f]{48})$/;
 
 /**
- * Tiny, dependency-free form server that collects a Qoder API key OUTSIDE of
+ * Tiny, dependency-free form server that collects a Qoder Personal Access
+ * Token (PAT) OUTSIDE of
  * Telegram chat (chat messages persist, can be forwarded, deletion is not
  * guaranteed). Links are single-use and short-lived (token is a random 48-hex
  * id stored only as a sha256 hash with an expiry).
@@ -146,15 +147,16 @@ function formHtml(): string {
 input{width:100%;padding:10px;margin:8px 0;box-sizing:border-box;font-family:monospace}
 button{padding:10px 18px;background:#2563eb;color:#fff;border:0;border-radius:6px;cursor:pointer}
 .hint{color:#666;font-size:13px}</style></head><body>
-<h2>Set your Qoder API key</h2>
-<p>This page is single-use and expires within minutes. The key is encrypted at rest
+<h2>Set your Qoder CLI Personal Access Token</h2>
+<p>First create or manage the token in your <a href="https://qoder.com/account/integrations" rel="noreferrer">Qoder Account Integrations</a> page.
+This page is single-use and expires within minutes. The token is encrypted at rest
 and is only ever injected into <b>your own</b> sessions.</p>
 <form method="POST" action="">
 <input type="password" name="api_key" autocomplete="off" spellcheck="false"
- autocapitalize="none" required placeholder="Qoder API key">
+ autocapitalize="none" required placeholder="Qoder Personal Access Token">
 <button type="submit">Save credential</button>
 </form>
-<p class="hint">Nothing about the key value is shown or logged afterwards — only its status
+<p class="hint">TeleOps keeps one encrypted Qoder CLI credential for your account. Nothing about the token value is shown or logged afterwards — only its status
 (configured / missing / invalid).</p>
 </body></html>`;
 }

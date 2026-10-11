@@ -60,6 +60,7 @@ const HISTORY_DEFAULT_LIMIT = 15;
 const HISTORY_MAX_LIMIT = 30;
 const LOGS_DEFAULT_LIMIT = 10;
 const LOGS_MAX_LIMIT = 25;
+const QODER_PAT_URL = "https://qoder.com/account/integrations";
 
 /**
  * Telegram is a thin View Layer over the core (docs §53/§79). It never touches
@@ -1361,6 +1362,10 @@ export class TelegramController {
       "The key is encrypted at rest and injected only into sessions that YOU own.",
       "It is never displayed here, nor in logs, history, notifications or session " +
         "output — only its status is.",
+      "",
+      "Create, view, or revoke your Qoder Personal Access Tokens (PATs) here:",
+      QODER_PAT_URL,
+      "TeleOps keeps one encrypted Qoder CLI credential for your account; token values are never listed.",
     ];
     const kb = new InlineKeyboard();
     if (!provision) {
@@ -1374,8 +1379,8 @@ export class TelegramController {
       const token = this.app.credentials.createProvisionToken(uid);
       lines.push(
         "",
-        `Open this ONE-TIME link (valid ${this.app.config.credentials.token_ttl_minutes} minutes, ` +
-          "single use) and paste the key into the form there:",
+        `After creating a PAT, open this ONE-TIME link (valid ${this.app.config.credentials.token_ttl_minutes} minutes, ` +
+          "single use) and paste it into the form:",
         "",
         provision.linkFor(token),
         "",
