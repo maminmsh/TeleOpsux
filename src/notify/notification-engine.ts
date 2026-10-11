@@ -48,6 +48,12 @@ export class NotificationEngine {
         return `✅ Session finished${sid}`;
       case "SESSION_STOPPED":
         return `⏹ Session stopped${sid}`;
+      // never includes the value — status only
+      case "CREDENTIAL_INVALID":
+        return (
+          `🔑 Your ${String(p.agent ?? "agent")} credential was rejected (status: invalid).\n` +
+          "Run /qoderkey to store a new one through the single-use secure link."
+        );
       case "SERVER_LOW_MEMORY":
         return `🚨 SERVER: RAM ${p.value}%`;
       case "SERVER_HIGH_DISK_USAGE":

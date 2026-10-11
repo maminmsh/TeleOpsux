@@ -12,6 +12,9 @@ import { PolicyEngine } from "./policy/policy-engine";
 import { NotificationEngine } from "./notify/notification-engine";
 import { ModuleErrorTracker } from "./core/error-tracker";
 import { HostService } from "./ssh/host-service";
+import { SecretBox } from "./shared/secret-box";
+import { CredentialService } from "./credentials/credential-service";
+import { ProvisionServer } from "./credentials/provision-server";
 import { LocalRunner } from "./exec/local-runner";
 import { ServerModeService } from "./server/server-mode";
 import { App } from "./core/container";
@@ -26,7 +29,18 @@ async function main(): Promise<void> {
   const db = new DB(config.paths.database_file);
   const bus = new EventBus(db);
   const tracker = new ModuleErrorTracker(bus, logs.system);
-  const hosts = new HostService(db, config.paths.secret_key_file);
+  const hosts = new HostService(db, config.paths.secret_key_file, config);
+
+  // Per-user Qoder credentials: encrypted at rest, revealed only at launch.
+  const credBox = new SecretBox(config.paths.secret_key_file);
+  const credentials = new CredentialService(
+    db,
+    credBox,
+    config.credentials.token_ttl_minutes,
+  );
+  const provision = config.credentials.provision.enabled
+    ? new ProvisionServer(credentials, config.credentials.provision)
+    : null;
 
   // Everything starts on the LOCAL transport; ServerModeService hot-swaps to
   // SSH when an active host exists.
@@ -35,6 +49,7 @@ async function main(): Promise<void> {
   const adapters = new AdapterRegistry(config.agents);
   const sessions = new SessionManager(db, bus, tmux, adapters, logs, config);
   sessions.setTracker(tracker);
+  sessions.setCredentials(credentials);
   const git = new GitManager(localRunner, (info) =>
     tracker.report("git", info.stderr, { repo: basename(info.cwd), command: info.command }),
   );
@@ -58,6 +73,8 @@ async function main(): Promise<void> {
     runner: localRunner,
     tracker,
     hosts,
+    credentials,
+    provision,
     projectFiles: null,
     serverMode: null as unknown as ServerModeService, // assigned below
   };
@@ -91,6 +108,23 @@ async function main(): Promise<void> {
   }
 
   notifications.start();
+  if (provision) {
+    try {
+      await provision.start();
+      logs.system.info(`credential provisioning form listening on ${provision.address()}`);
+    } catch (e) {
+      tracker.report("credentials", e, { step: "provision_start" });
+      logs.system.warn(
+        "credential provisioning form is NOT running — users cannot store a Qoder key " +
+          "until this is fixed (Qoder sessions stay blocked for them).",
+      );
+    }
+  } else {
+    logs.system.warn(
+      "credentials.provision.enabled=false — Qoder sessions require a credential stored " +
+        "through another secure path; users have no self-service way to provide one.",
+    );
+  }
   app.serverMode.ensureMonitorRunning();
 
   let telegram: TelegramController | null = null;
@@ -107,12 +141,18 @@ async function main(): Promise<void> {
 
   if (config.security.allowed_users.length === 0)
     logs.system.warn("no allowed_users configured — nobody can use the bot. Set security.allowed_users.");
+  if (config.security.admin_users === undefined && config.security.allowed_users.length > 1)
+    logs.system.warn(
+      "security.admin_users is not set — every allowed user has FULL admin access (legacy mode). " +
+        "Set admin_users to enable per-user isolation.",
+    );
 
   const shutdown = async (signal: string): Promise<void> => {
     logs.system.info(`received ${signal}, shutting down`);
     try {
       app.monitor.stop();
       app.serverMode.connection?.close();
+      provision?.stop();
       sessions.shutdown();
       if (telegram) await telegram.stop();
       logs.system.info("telegram bot stopped");

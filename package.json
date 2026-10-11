@@ -11,6 +11,7 @@
     "start": "node dist/main.js",
     "dev": "tsx watch src/main.ts",
     "db:migrate": "tsx src/db/cli.ts migrate",
+    "test": "node --import tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

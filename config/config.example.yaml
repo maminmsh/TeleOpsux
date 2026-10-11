@@ -12,9 +12,20 @@ sessions:
   tmux_prefix: teleops         # tmux session names are prefixed with this
 
 security:
-  # Telegram user IDs allowed to use the control center.
+  # Telegram user IDs allowed to use the control center. Everyone else is rejected.
   allowed_users:
     - 000000000
+  # Telegram user IDs with admin rights: see ALL sessions/projects/hosts (incl.
+  # legacy unowned ones), global server/health/alerts/settings, and may /claim
+  # ownership of resources.
+  # IMPORTANT: if this key is omitted entirely, every allowed user is treated
+  # as an admin (legacy single-owner mode). Set an explicit list — even an
+  # empty one — to get real per-user isolation.
+  admin_users:
+    - 000000000
+  # Copy every session notification to admins in addition to the owner.
+  # (Non-session events — server alerts etc. — always go to admins only.)
+  admin_receive_all_notifications: false
   # Absolute project roots the control center may operate in. Empty = use defaults below.
   project_roots: []
 
@@ -66,8 +77,28 @@ notifications:
     COMMAND_FAILED: telegram_notify
     PROCESS_CRASHED: telegram_notify
     SESSION_FINISHED: telegram_notify
+    CREDENTIAL_INVALID: telegram_notify
     SERVER_LOW_MEMORY: telegram_notify
     SERVER_HIGH_DISK_USAGE: telegram_notify
+
+# Per-user agent credentials (Qoder). Each user must supply their OWN API key;
+# a shared server key or shared qoder login is never used as a fallback.
+credentials:
+  # How long a one-time provisioning link stays valid.
+  token_ttl_minutes: 10
+  provision:
+    # Set to false for strict fail-closed: users then have no self-service way
+    # to store a key, so Qoder sessions stay blocked until provisioned another way.
+    enabled: true
+    # 127.0.0.1 is a browser secure context and the key never crosses the
+    # network — remote users reach it through an SSH tunnel
+    # (ssh -L 8717:127.0.0.1:8717 user@teleops-host).
+    host: 127.0.0.1
+    port: 8717
+    # When sitting behind a TLS-terminating reverse proxy, put its https://
+    # origin here; links then use it. The server REFUSES a non-loopback bind
+    # unless base_url is https://, so API keys never travel over plain HTTP.
+    base_url: ""
 
 # Remote server (SSH) — added at runtime via /addserver; these are connection tuning knobs.
 ssh:

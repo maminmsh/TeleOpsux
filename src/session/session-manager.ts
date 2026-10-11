@@ -7,7 +7,13 @@ import { Config } from "../config/config";
 import { assertTransition } from "./state-machine";
 import { ProjectFiles } from "./project-files";
 import type { ExecRunner } from "../exec/exec-runner";
+import { LocalRunner } from "../exec/local-runner";
 import type { ModuleErrorTracker } from "../core/error-tracker";
+import {
+  CredentialRequiredError,
+  CredentialService,
+  CREDENTIAL_IN_CHAT_MESSAGE,
+} from "../credentials/credential-service";
 import {
   SessionRecord,
   SessionStatus,
@@ -19,6 +25,7 @@ interface Runtime {
   lastOutput: string;
   status: SessionStatus;
   idleReported: boolean;
+  credentialReported: boolean;
 }
 
 export interface CreateSessionParams {
@@ -33,6 +40,8 @@ export interface CreateSessionParams {
   cwd: string;
   task?: string;
   branch?: string;
+  /** Telegram user that owns the session. NULL only for legacy/system rows. */
+  owner_telegram_user_id?: number | null;
 }
 
 export interface HostDeps {
@@ -57,6 +66,9 @@ export class SessionManager {
   private host: HostDeps | null = null;
   private tracker: ModuleErrorTracker | null = null;
   private localTmux: Tmux;
+  private readonly localRunner = new LocalRunner();
+  private runner: ExecRunner = this.localRunner;
+  private creds: CredentialService | null = null;
 
   constructor(
     private db: DB,
@@ -73,10 +85,28 @@ export class SessionManager {
   attachHost(deps: HostDeps | null): void {
     this.host = deps;
     this.tmux = deps?.tmux ?? this.localTmux;
+    this.runner = deps?.runner ?? this.localRunner;
   }
 
   setTracker(tracker: ModuleErrorTracker): void {
     this.tracker = tracker;
+  }
+
+  /**
+   * Per-user credential store. Without it, any agent declaring
+   * `credentialEnvVar` FAILS CLOSED (no shared server login fallback).
+   */
+  setCredentials(creds: CredentialService): void {
+    this.creds = creds;
+  }
+
+  /**
+   * A credential is never allowed into chat history, task text or the agent
+   * pane — reject input that contains one (also blocks pasting someone else's).
+   */
+  private assertNoCredentialInText(text: string | undefined): void {
+    if (text && this.creds?.containsStoredSecret(text))
+      throw new Error(CREDENTIAL_IN_CHAT_MESSAGE);
   }
 
   get remoteMode(): boolean {
@@ -99,9 +129,18 @@ export class SessionManager {
   }
 
   async create(params: CreateSessionParams): Promise<SessionRecord> {
+    this.assertNoCredentialInText(params.task);
     const adapter = this.adapters.get(params.agent);
     if (!adapter)
       throw new Error(`Agent "${params.agent}" is not available.`);
+
+    // fail-closed: an agent that declares credentialEnvVar runs ONLY with the
+    // owning user's own credential — never a shared server key/login
+    if (
+      adapter.credentialEnvVar &&
+      !this.creds?.hasCredential(params.owner_telegram_user_id ?? null)
+    )
+      throw new CredentialRequiredError();
 
     let cwd = params.cwd;
     if (this.host) {
@@ -126,6 +165,7 @@ export class SessionManager {
       project_id: params.project_id,
       agent_type: params.agent,
       cwd,
+      owner_telegram_user_id: params.owner_telegram_user_id ?? null,
     });
     this.db.updateSession(session.id, {
       terminal_id: String(session.id),
@@ -140,9 +180,14 @@ export class SessionManager {
   }
 
   async start(sessionId: number, task?: string): Promise<SessionRecord> {
+    this.assertNoCredentialInText(task);
     const session = this.mustGet(sessionId);
     const adapter = this.adapters.get(session.agent_type);
     if (!adapter) throw new Error(`No adapter for ${session.agent_type}`);
+
+    const needsCred = Boolean(adapter.credentialEnvVar);
+    if (needsCred && !this.creds?.hasCredential(session.owner_telegram_user_id))
+      throw new CredentialRequiredError();
 
     if (!(await this.tmux.available()))
       throw new Error(
@@ -151,15 +196,37 @@ export class SessionManager {
 
     this.transition(sessionId, "STARTING");
     const name = String(sessionId);
-    const opts = { cwd: session.cwd, project: session.name, task: task ?? undefined };
 
     if (!(await this.tmux.exists(name))) {
-      await this.tmux.newSession(name, session.cwd, adapter.launchCommand(opts));
+      let secretFilePath: string | undefined;
+      if (needsCred) {
+        const uid = session.owner_telegram_user_id!;
+        const key = this.creds!.revealForLaunch(uid);
+        if (!key) {
+          this.creds!.markInvalid(uid);
+          throw new CredentialRequiredError();
+        }
+        secretFilePath = this.credentialFilePath(sessionId);
+        await this.stageCredentialFile(secretFilePath, key);
+      }
+      const opts = {
+        cwd: session.cwd,
+        project: session.name,
+        task: task ?? undefined,
+        secretFilePath,
+      };
+      try {
+        await this.tmux.newSession(name, session.cwd, adapter.launchCommand(opts));
+      } catch (e) {
+        if (secretFilePath) await this.removeCredentialFile(secretFilePath);
+        throw e;
+      }
       await this.setupTaskLog(session, task);
     }
 
     const pid = await this.tmux.panePid(name);
     this.db.updateSession(sessionId, { pid });
+    const opts = { cwd: session.cwd, project: session.name, task: task ?? undefined };
     const initial = adapter.initialInput?.(opts);
     if (initial) {
       // give the TUI a moment to render before typing the task
@@ -180,6 +247,7 @@ export class SessionManager {
       lastOutput: "",
       status: "WORKING",
       idleReported: false,
+      credentialReported: false,
     });
     this.bus.emit({ type: "SESSION_STARTED", session_id: sessionId });
     this.ensurePolling();
@@ -193,6 +261,8 @@ export class SessionManager {
     await this.tmux.killSession(String(sessionId));
     this.transition(sessionId, "STOPPED");
     this.runtime.delete(sessionId);
+    // best-effort: a crashed launch may have left the staged key on disk
+    await this.removeCredentialFile(this.credentialFilePath(sessionId));
     this.bus.emit({ type: "SESSION_STOPPED", session_id: sessionId });
   }
 
@@ -210,6 +280,7 @@ export class SessionManager {
   }
 
   async sendInput(sessionId: number, text: string): Promise<void> {
+    this.assertNoCredentialInText(text);
     const session = this.mustGet(sessionId);
     await this.tmux.sendInput(String(sessionId), text);
     this.db.addMessage({
@@ -254,6 +325,39 @@ export class SessionManager {
     const s = this.db.getSession(id);
     if (!s) throw new Error(`Session #${id} not found`);
     return s;
+  }
+
+  /**
+   * Path of the one-shot credential file for a session, on the SESSION HOST
+   * (local FS in local mode, remote FS over SSH). Derived from the numeric
+   * session id only — never from user text. Returned UNQUOTED; every use site
+   * wraps it in double quotes so a `$HOME` containing spaces stays one word.
+   */
+  private credentialFilePath(sessionId: number): string {
+    return `$HOME/.teleops-credentials/teleops-session-${sessionId}.key`;
+  }
+
+  /**
+   * Stage the owner's key into a 0600 file on the session host. The key is
+   * written through the runner's STDIN channel (`input`) — it never appears in
+   * argv, TeleOps process env, logs, or any output stream. The pane's launch
+   * command reads and deletes the file at start.
+   */
+  private async stageCredentialFile(pathExpr: string, key: string): Promise<void> {
+    const r = await this.runner.execScript(
+      `umask 077 && mkdir -p "$(dirname "${pathExpr}")" && cat > "${pathExpr}" && chmod 600 "${pathExpr}"`,
+      { input: key, timeoutMs: 20_000 },
+    );
+    if (r.code !== 0)
+      throw new Error("could not stage the credential file on the session host");
+  }
+
+  private async removeCredentialFile(pathExpr: string): Promise<void> {
+    try {
+      await this.runner.execScript(`rm -f "${pathExpr}"`, { timeoutMs: 15_000 });
+    } catch {
+      /* best-effort cleanup */
+    }
   }
 
   /** Best-effort: create .teleops/logs file (via pipe-pane) + task_logs row + memory entry. */
@@ -352,6 +456,7 @@ export class SessionManager {
       lastOutput: "",
       status: "WORKING",
       idleReported: false,
+      credentialReported: false,
     });
     this.db.setStatus(id, "WORKING");
     this.bus.emit({
@@ -467,6 +572,22 @@ export class SessionManager {
     }
 
     const next = adapter.classifyStatus(output, true);
+
+    // auth failures are a CREDENTIAL problem, not a task problem: mark the
+    // owner's credential invalid (status only — the value is never logged)
+    if (!rt.credentialReported && adapter.detectCredentialError?.(output)) {
+      rt.credentialReported = true;
+      const uid = session.owner_telegram_user_id;
+      if (uid != null) {
+        this.creds?.markInvalid(uid);
+        this.bus.emit({
+          type: "CREDENTIAL_INVALID",
+          session_id: id,
+          payload: { status: "invalid", agent: session.agent_type },
+          severity: "WARNING",
+        });
+      }
+    }
 
     // idle detection: no new output for a long time while supposedly working
     const idleMs = Date.now() - rt.lastActivityMs;

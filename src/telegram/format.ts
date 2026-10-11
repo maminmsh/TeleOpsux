@@ -21,12 +21,14 @@ export function sessionLine(
   s: SessionRecord,
   index: number,
   projectName?: string,
+  owner?: string,
 ): string {
   const emoji = STATUS_EMOJI[s.status];
   const lines = [
     `${index}. ${s.name}`,
     `   Agent: ${s.agent_type}  ·  ${emoji} ${s.status}`,
     `   Project: ${projectName ?? "—"}  ·  Branch: ${s.branch ?? "—"}`,
+    ...(owner ? [`   Owner: ${owner}`] : []),
     `   Last activity: ${ago(s.updated_at)}`,
   ];
   if (s.waiting_reason) lines.push(`   Waiting: ${s.waiting_reason.slice(0, 120)}`);
@@ -36,11 +38,19 @@ export function sessionLine(
 export function sessionsList(
   sessions: SessionRecord[],
   projectName: (id: number | null) => string | undefined,
+  ownerLabel?: (s: SessionRecord) => string | undefined,
 ): string {
   if (sessions.length === 0) return "🤖 AI SESSIONS\n\nNo sessions yet.\nUse /new to create one.";
   const head = "🤖 AI SESSIONS\n";
   const body = sessions
-    .map((s, i) => sessionLine(s, i + 1, s.project_id ? projectName(s.project_id) : undefined))
+    .map((s, i) =>
+      sessionLine(
+        s,
+        i + 1,
+        s.project_id ? projectName(s.project_id) : undefined,
+        ownerLabel?.(s),
+      ),
+    )
     .join("\n\n");
   return `${head}\n${body}`;
 }

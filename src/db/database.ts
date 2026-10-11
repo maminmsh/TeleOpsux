@@ -5,9 +5,11 @@ import { runMigrations } from "./migrations";
 import {
   Approval,
   ApprovalStatus,
+  CredentialStatus,
   DomainEvent,
   MessageDirection,
   Project,
+  ResourceVisibility,
   SessionMessage,
   SessionRecord,
   SessionStatus,
@@ -96,10 +98,18 @@ export class DB {
   }
 
   // ---- projects ----
-  createProject(name: string, root: string, host_id?: number | null): Project {
+  createProject(
+    name: string,
+    root: string,
+    host_id?: number | null,
+    owner_telegram_user_id?: number | null,
+    visibility: ResourceVisibility = "private",
+  ): Project {
     const info = this.db
-      .prepare("INSERT INTO projects (name, root, host_id) VALUES (?, ?, ?)")
-      .run(name, root, host_id ?? null);
+      .prepare(
+        "INSERT INTO projects (name, root, host_id, owner_telegram_user_id, visibility) VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(name, root, host_id ?? null, owner_telegram_user_id ?? null, visibility);
     return this.getProject(Number(info.lastInsertRowid))!;
   }
   getProject(id: number): Project | undefined {
@@ -107,8 +117,19 @@ export class DB {
       | Project
       | undefined;
   }
+  /** Admin view: everything. Normal users must use listProjectsForOwner. */
   listProjects(): Project[] {
     return this.db.prepare("SELECT * FROM projects ORDER BY id").all() as Project[];
+  }
+  /** Owner-scoped query: rows owned by the user plus explicitly shared ones. */
+  listProjectsForOwner(ownerTelegramUserId: number): Project[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM projects
+         WHERE owner_telegram_user_id = ? OR visibility = 'shared'
+         ORDER BY id`,
+      )
+      .all(ownerTelegramUserId) as Project[];
   }
   listRemoteProjects(hostId: number): Project[] {
     return this.db
@@ -118,6 +139,11 @@ export class DB {
   deleteProject(id: number): void {
     this.db.prepare("DELETE FROM projects WHERE id = ?").run(id);
   }
+  setProjectOwner(id: number, ownerTelegramUserId: number): void {
+    this.db
+      .prepare("UPDATE projects SET owner_telegram_user_id = ? WHERE id = ?")
+      .run(ownerTelegramUserId, id);
+  }
 
   // ---- ssh hosts ----
   createHost(h: {
@@ -126,13 +152,19 @@ export class DB {
     port: number;
     username: string;
     password_enc: string;
+    owner_telegram_user_id?: number | null;
+    visibility?: ResourceVisibility;
   }): SshHost {
     const info = this.db
       .prepare(
-        `INSERT INTO ssh_hosts (name, host, port, username, password_enc)
-         VALUES (@name, @host, @port, @username, @password_enc)`,
+        `INSERT INTO ssh_hosts (name, host, port, username, password_enc, owner_telegram_user_id, visibility)
+         VALUES (@name, @host, @port, @username, @password_enc, @owner_telegram_user_id, @visibility)`,
       )
-      .run(h);
+      .run({
+        owner_telegram_user_id: null,
+        visibility: "private" as ResourceVisibility,
+        ...h,
+      });
     return this.getHost(Number(info.lastInsertRowid))!;
   }
   getHost(id: number): SshHost | undefined {
@@ -156,6 +188,16 @@ export class DB {
   listHosts(): SshHost[] {
     return this.db.prepare("SELECT * FROM ssh_hosts ORDER BY id").all() as SshHost[];
   }
+  /** Owner-scoped query: the user's own hosts plus explicitly shared ones. */
+  listHostsForOwner(ownerTelegramUserId: number): SshHost[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM ssh_hosts
+         WHERE owner_telegram_user_id = ? OR visibility = 'shared'
+         ORDER BY id`,
+      )
+      .all(ownerTelegramUserId) as SshHost[];
+  }
   getActiveHost(): SshHost | undefined {
     return this.db
       .prepare("SELECT * FROM ssh_hosts WHERE is_active = 1 LIMIT 1")
@@ -173,6 +215,135 @@ export class DB {
   }
   deleteHost(id: number): void {
     this.db.prepare("DELETE FROM ssh_hosts WHERE id = ?").run(id);
+  }
+
+  // ---- per-user host choice + chat routing ----
+  getUserActiveHostId(telegramUserId: number): number | null {
+    const row = this.db
+      .prepare("SELECT host_id FROM user_active_hosts WHERE telegram_user_id = ?")
+      .get(telegramUserId) as { host_id: number } | undefined;
+    return row?.host_id ?? null;
+  }
+  setUserActiveHost(telegramUserId: number, hostId: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO user_active_hosts (telegram_user_id, host_id, updated_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(telegram_user_id) DO UPDATE SET host_id = excluded.host_id, updated_at = excluded.updated_at`,
+      )
+      .run(telegramUserId, hostId);
+  }
+  clearUserActiveHost(telegramUserId: number): void {
+    this.db
+      .prepare("DELETE FROM user_active_hosts WHERE telegram_user_id = ?")
+      .run(telegramUserId);
+  }
+  getUserChat(telegramUserId: number): number | null {
+    const row = this.db
+      .prepare("SELECT chat_id FROM user_chats WHERE telegram_user_id = ?")
+      .get(telegramUserId) as { chat_id: number } | undefined;
+    return row?.chat_id ?? null;
+  }
+  /** Record/refresh the chat to deliver this user's notifications into. */
+  upsertUserChat(telegramUserId: number, chatId: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO user_chats (telegram_user_id, chat_id, updated_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(telegram_user_id) DO UPDATE SET chat_id = excluded.chat_id, updated_at = excluded.updated_at`,
+      )
+      .run(telegramUserId, chatId);
+  }
+
+  // ---- per-user qoder credentials ----
+  /** key_enc is AES-256-GCM at rest; UI layers must use listCredentialStatuses. */
+  getQoderCredential(telegramUserId: number): { key_enc: string; status: string } | undefined {
+    return this.db
+      .prepare(
+        "SELECT key_enc, status FROM qoder_credentials WHERE telegram_user_id = ?",
+      )
+      .get(telegramUserId) as { key_enc: string; status: string } | undefined;
+  }
+  upsertQoderCredential(telegramUserId: number, keyEnc: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO qoder_credentials (telegram_user_id, key_enc, status, updated_at)
+         VALUES (?, ?, 'configured', datetime('now'))
+         ON CONFLICT(telegram_user_id)
+         DO UPDATE SET key_enc = excluded.key_enc, status = 'configured', updated_at = excluded.updated_at`,
+      )
+      .run(telegramUserId, keyEnc);
+  }
+  setCredentialStatus(telegramUserId: number, status: CredentialStatus): void {
+    this.db
+      .prepare(
+        "UPDATE qoder_credentials SET status = ?, updated_at = datetime('now') WHERE telegram_user_id = ?",
+      )
+      .run(status, telegramUserId);
+  }
+  deleteQoderCredential(telegramUserId: number): void {
+    this.db
+      .prepare("DELETE FROM qoder_credentials WHERE telegram_user_id = ?")
+      .run(telegramUserId);
+  }
+  /** Statuses ONLY — never the encrypted value. For admin visibility. */
+  listCredentialStatuses(): Array<{
+    telegram_user_id: number;
+    status: CredentialStatus;
+    updated_at: string;
+  }> {
+    return this.db
+      .prepare(
+        "SELECT telegram_user_id, status, updated_at FROM qoder_credentials ORDER BY telegram_user_id",
+      )
+      .all() as Array<{
+      telegram_user_id: number;
+      status: CredentialStatus;
+      updated_at: string;
+    }>;
+  }
+
+  /** Internal scrubbing support — encrypted blobs only, never returned to UI. */
+  listCredentialKeyBlobs(): Array<{ telegram_user_id: number; key_enc: string }> {
+    return this.db
+      .prepare("SELECT telegram_user_id, key_enc FROM qoder_credentials")
+      .all() as Array<{ telegram_user_id: number; key_enc: string }>;
+  }
+
+  // ---- credential provisioning grants (single-use, short-lived) ----
+  createCredentialGrant(tokenHash: string, telegramUserId: number, expiresAt: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO credential_grants (token_hash, telegram_user_id, expires_at)
+         VALUES (?, ?, ?)`,
+      )
+      .run(tokenHash, telegramUserId, expiresAt);
+  }
+  getCredentialGrant(tokenHash: string):
+    | { telegram_user_id: number; expires_at: string; used_at: string | null }
+    | undefined {
+    return this.db
+      .prepare(
+        "SELECT telegram_user_id, expires_at, used_at FROM credential_grants WHERE token_hash = ?",
+      )
+      .get(tokenHash) as
+    | { telegram_user_id: number; expires_at: string; used_at: string | null }
+    | undefined;
+  }
+  markCredentialGrantUsed(tokenHash: string): void {
+    this.db
+      .prepare("UPDATE credential_grants SET used_at = datetime('now') WHERE token_hash = ?")
+      .run(tokenHash);
+  }
+  deleteCredentialGrantsForUser(telegramUserId: number): void {
+    this.db
+      .prepare("DELETE FROM credential_grants WHERE telegram_user_id = ?")
+      .run(telegramUserId);
+  }
+  purgeExpiredCredentialGrants(): void {
+    this.db
+      .prepare("DELETE FROM credential_grants WHERE expires_at < datetime('now')")
+      .run();
   }
 
   // ---- task logs ----
@@ -220,6 +391,17 @@ export class DB {
       " ORDER BY id DESC LIMIT @limit";
     return this.db.prepare(sql).all(params) as TaskLog[];
   }
+  /** Owner-scoped query: task logs of the user's own sessions only. */
+  listTaskLogsForOwner(ownerTelegramUserId: number, limit = 20): TaskLog[] {
+    return this.db
+      .prepare(
+        `SELECT t.* FROM task_logs t
+         JOIN sessions s ON s.id = t.session_id
+         WHERE s.owner_telegram_user_id = ?
+         ORDER BY t.id DESC LIMIT ?`,
+      )
+      .all(ownerTelegramUserId, limit) as TaskLog[];
+  }
 
   // ---- sessions ----
   createSession(s: {
@@ -227,13 +409,14 @@ export class DB {
     project_id: number | null;
     agent_type: string;
     cwd: string;
+    owner_telegram_user_id?: number | null;
   }): SessionRecord {
     const info = this.db
       .prepare(
-        `INSERT INTO sessions (name, project_id, agent_type, cwd, status)
-         VALUES (@name, @project_id, @agent_type, @cwd, 'CREATED')`,
+        `INSERT INTO sessions (name, project_id, agent_type, cwd, status, owner_telegram_user_id)
+         VALUES (@name, @project_id, @agent_type, @cwd, 'CREATED', @owner_telegram_user_id)`,
       )
-      .run(s);
+      .run({ owner_telegram_user_id: null, ...s });
     return this.getSession(Number(info.lastInsertRowid))!;
   }
   getSession(id: number): SessionRecord | undefined {
@@ -241,10 +424,22 @@ export class DB {
       | SessionRecord
       | undefined;
   }
+  /** Admin view: every session, including legacy unowned rows. */
   listSessions(): SessionRecord[] {
     return this.db
       .prepare("SELECT * FROM sessions ORDER BY id DESC")
       .all() as SessionRecord[];
+  }
+  /** Owner-scoped query for normal users — legacy NULL-owner rows never appear. */
+  listSessionsForOwner(ownerTelegramUserId: number): SessionRecord[] {
+    return this.db
+      .prepare("SELECT * FROM sessions WHERE owner_telegram_user_id = ? ORDER BY id DESC")
+      .all(ownerTelegramUserId) as SessionRecord[];
+  }
+  setSessionOwner(id: number, ownerTelegramUserId: number): void {
+    this.db
+      .prepare("UPDATE sessions SET owner_telegram_user_id = ? WHERE id = ?")
+      .run(ownerTelegramUserId, id);
   }
   updateSession(
     id: number,

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(which tmux && tmux -V; which qoder codex; node -v)"
+      "Bash(which tmux && tmux -V; which qoder codex; node -v)",
+      "Bash(find . -type f \\\\\\( -name \"*.ts\" -o -name \"*.yaml\" -o -name \"*.md\" -o -name \"*.json\" \\\\\\) -not -path \"*/node_modules/*\" -not -path \"*/dist/*\" | head -50)"
     ]
   }
 }

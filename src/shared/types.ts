@@ -44,6 +44,7 @@ export type EventType =
   | "SERVER_HIGH_DISK_USAGE"
   | "SERVER_HIGH_CPU"
   | "MODULE_ERROR"
+  | "CREDENTIAL_INVALID"
   | "SSH_CONNECTED"
   | "SSH_DISCONNECTED";
 
@@ -55,12 +56,24 @@ export interface DomainEvent {
   created_at: string;
 }
 
+export type ResourceVisibility = "private" | "shared";
+
+/**
+ * Per-user credential state. "missing" is represented by the ABSENCE of a row.
+ * The secret value itself is never part of any status/UI surface.
+ */
+export type CredentialStatus = "configured" | "invalid";
+
 export interface Project {
   id: number;
   name: string;
   root: string;
   /** NULL = legacy local root; set = path on that ssh host. */
   host_id: number | null;
+  /** Owning Telegram user; NULL = legacy row, admin-only. */
+  owner_telegram_user_id: number | null;
+  /** "shared" resources are usable by all allowed users; only admins may manage them. */
+  visibility: ResourceVisibility;
   created_at: string;
 }
 
@@ -73,6 +86,9 @@ export interface SshHost {
   /** AES-256-GCM encrypted password, base64 (iv:tag:ciphertext). Never sent to logs/Telegram. */
   password_enc: string;
   is_active: number;
+  /** Owning Telegram user; NULL = legacy row, admin-only. */
+  owner_telegram_user_id: number | null;
+  visibility: ResourceVisibility;
   created_at: string;
   updated_at: string;
 }
@@ -95,6 +111,8 @@ export interface SessionRecord {
   project_id: number | null;
   agent_type: AgentType;
   cwd: string;
+  /** Owning Telegram user; NULL = legacy row migrated before multi-user support, admin-only. */
+  owner_telegram_user_id: number | null;
   terminal_id: string | null;
   pid: number | null;
   status: SessionStatus;

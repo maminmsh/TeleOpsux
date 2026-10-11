@@ -7,6 +7,21 @@ export interface AgentsConfig {
   [agent: string]: { enabled: boolean; command: string };
 }
 
+export interface SecurityConfig {
+  /** Telegram user ids allowed to use the bot at all (normal users + admins). */
+  allowed_users: number[];
+  /**
+   * Telegram user ids with full operator access (sees/manages ALL resources).
+   * When undefined (legacy config), every allowed user is treated as admin so
+   * existing single-operator setups keep working — set admin_users to enable
+   * real per-user isolation.
+   */
+  admin_users?: number[];
+  /** Also deliver every session notification to admins, not only the owner. */
+  admin_receive_all_notifications?: boolean;
+  project_roots: string[];
+}
+
 export interface Config {
   telegram: { enabled: boolean; botToken: string };
   sessions: {
@@ -16,7 +31,7 @@ export interface Config {
     reconnect: boolean;
     tmux_prefix: string;
   };
-  security: { allowed_users: number[]; project_roots: string[] };
+  security: SecurityConfig;
   agents: AgentsConfig;
   monitor: {
     interval_seconds: number;
@@ -34,6 +49,22 @@ export interface Config {
     exec_timeout_seconds: number;
     ready_timeout_seconds: number;
     keepalive_seconds: number;
+  };
+  credentials: {
+    /** One-time provisioning links expire after this many minutes. */
+    token_ttl_minutes: number;
+    /**
+     * Local HTTP form server used to collect API keys OUT of Telegram chat.
+     * bind host defaults to 127.0.0.1 (browser "secure context" locally; a
+     * remote user reaches it through an SSH tunnel). Set base_url to a
+     * https:// origin when sitting behind a TLS-terminating reverse proxy.
+     */
+    provision: {
+      enabled: boolean;
+      host: string;
+      port: number;
+      base_url: string;
+    };
   };
   paths: {
     database_file: string;
@@ -79,12 +110,17 @@ const DEFAULTS: Config = {
       COMMAND_FAILED: "telegram_notify",
       PROCESS_CRASHED: "telegram_notify",
       SESSION_FINISHED: "telegram_notify",
+      CREDENTIAL_INVALID: "telegram_notify",
     },
   },
   ssh: {
     exec_timeout_seconds: 20,
     ready_timeout_seconds: 15,
     keepalive_seconds: 15,
+  },
+  credentials: {
+    token_ttl_minutes: 10,
+    provision: { enabled: true, host: "127.0.0.1", port: 8717, base_url: "" },
   },
   paths: {
     database_file: "./data/teleops.db",

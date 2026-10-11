@@ -15,6 +15,12 @@ import type { HostService } from "../ssh/host-service";
 import type { ProjectFiles } from "../session/project-files";
 import type { ServerModeService } from "../server/server-mode";
 import type { FullReport } from "../monitor/remote-monitor";
+import type { CredentialService } from "../credentials/credential-service";
+import type { ProvisionServer } from "../credentials/provision-server";
+import {
+  isAdminUser as _isAdminUser,
+  isAllowedUser as _isAllowedUser,
+} from "../auth/access";
 
 /** Common surface of the local and remote monitors. */
 export interface MonitorLike {
@@ -46,11 +52,17 @@ export interface App {
   runner: ExecRunner;
   tracker: ModuleErrorTracker;
   hosts: HostService;
+  credentials: CredentialService;
+  /** null when credentials.provision.enabled is false (strict fail-closed). */
+  provision: ProvisionServer | null;
   projectFiles: ProjectFiles | null;
   serverMode: ServerModeService;
 }
 
 export function isAllowedUser(app: App, userId: number | undefined): boolean {
-  if (userId == null) return false;
-  return app.config.security.allowed_users.includes(userId);
+  return _isAllowedUser(app, userId);
+}
+
+export function isAdminUser(app: App, userId: number | undefined): boolean {
+  return _isAdminUser(app, userId);
 }

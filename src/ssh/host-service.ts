@@ -1,10 +1,10 @@
-import crypto from "node:crypto";
-import fs from "node:fs";
-import path from "node:path";
 import { Client } from "ssh2";
 import type { DB } from "../db/database";
 import type { SshHost } from "../shared/types";
 import type { SshHostCredentials } from "./ssh-connection";
+import type { Config } from "../config/config";
+import { SecretBox } from "../shared/secret-box";
+import { isAdminUser } from "../auth/access";
 
 /**
  * Passwords are encrypted with AES-256-GCM at rest. The key lives in a
@@ -12,11 +12,11 @@ import type { SshHostCredentials } from "./ssh-connection";
  * DB dumps/backups, NOT against someone with shell access to the TeleOps box.
  */
 export class HostService {
-  private key: Buffer | null = null;
-
   constructor(
     private db: DB,
     private keyFile: string,
+    /** When provided, activation is admin-gated per user. Without it every activation is global (legacy). */
+    private config?: Config,
   ) {}
 
   addHost(input: {
@@ -26,8 +26,19 @@ export class HostService {
     password: string;
     name?: string;
     activate?: boolean;
+    /** Owning Telegram user; normal users only ever see/manage their own hosts. */
+    owner?: number | null;
   }): SshHost {
-    const name = input.name?.trim() || input.host;
+    const owner = input.owner ?? null;
+    const baseName = input.name?.trim() || input.host;
+    // Names are globally unique; per-owner disambiguation keeps two users from
+    // silently overwriting each other's host row.
+    const taken = new Set(this.db.listHosts().map((h) => h.name));
+    let name = baseName;
+    const sameOwnerRow = this.db.listHosts().find((h) => h.name === baseName);
+    if (taken.has(name) && sameOwnerRow && sameOwnerRow.owner_telegram_user_id !== owner) {
+      for (let i = 2; taken.has(name); i++) name = `${baseName}-${i}`;
+    }
     // Re-adding the same display name updates the row in place: projects keep
     // their host_id FK and the active flag survives.
     const existing = this.db.listHosts().find((h) => h.name === name);
@@ -39,7 +50,7 @@ export class HostService {
         password_enc: this.encrypt(input.password),
       });
       const host = this.db.getHost(existing.id)!;
-      if (input.activate) this.db.setActiveHost(host.id);
+      if (input.activate) this.activate(owner, host.id);
       return host;
     }
     const host = this.db.createHost({
@@ -48,13 +59,45 @@ export class HostService {
       port: input.port,
       username: input.username,
       password_enc: this.encrypt(input.password),
+      owner_telegram_user_id: owner,
     });
-    if (input.activate) this.db.setActiveHost(host.id);
+    if (input.activate) this.activate(owner, host.id);
     return host;
+  }
+
+  /**
+   * Make a host the user's working server. Admins also flip the GLOBAL active
+   * host (which the SSH transport follows); normal users only update their own
+   * per-user pointer, so one user's switch never moves another user's target.
+   */
+  private activate(owner: number | null, hostId: number): void {
+    // A normal user never STEALS the global transport from an existing active
+    // host; but if nothing is connected yet, their host becomes the working
+    // transport so single-user deployments keep working out of the box.
+    if (this.isGlobalAdmin(owner) || !this.db.getActiveHost()) this.db.setActiveHost(hostId);
+    if (owner !== null) this.db.setUserActiveHost(owner, hostId);
+  }
+
+  private isGlobalAdmin(owner: number | null): boolean {
+    if (!this.config) return true; // legacy: single-operator deployments
+    if (owner === null) return true;
+    return isAdminUser({ config: this.config }, owner);
   }
 
   activateHost(id: number): void {
     this.db.setActiveHost(id);
+  }
+
+  activateHostForUser(telegramUserId: number, hostId: number): void {
+    if (!this.db.getHost(hostId)) return;
+    const global = this.db.getActiveHost();
+    if (
+      this.isGlobalAdmin(telegramUserId) ||
+      !global ||
+      global.owner_telegram_user_id === telegramUserId
+    )
+      this.db.setActiveHost(hostId);
+    this.db.setUserActiveHost(telegramUserId, hostId);
   }
 
   getHost(id: number): SshHost | undefined {
@@ -136,34 +179,17 @@ export class HostService {
     });
   }
 
-  // ---- crypto ----
-  private loadKey(): Buffer {
-    if (this.key) return this.key;
-    if (fs.existsSync(this.keyFile)) {
-      this.key = Buffer.from(fs.readFileSync(this.keyFile, "utf8").trim(), "hex");
-      if (this.key.length !== 32) throw new Error(`${this.keyFile} is not a 32-byte hex key`);
-    } else {
-      this.key = crypto.randomBytes(32);
-      fs.mkdirSync(path.dirname(path.resolve(this.keyFile)), { recursive: true });
-      fs.writeFileSync(this.keyFile, this.key.toString("hex"), { mode: 0o600 });
-    }
-    return this.key;
+  // ---- crypto ---- (shared SecretBox; format identical to pre-refactor blobs)
+  private get box(): SecretBox {
+    return (this._box ??= new SecretBox(this.keyFile));
   }
+  private _box: SecretBox | null = null;
 
   private encrypt(plain: string): string {
-    const key = this.loadKey();
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
-    const enc = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
-    return [iv.toString("base64"), cipher.getAuthTag().toString("base64"), enc.toString("base64")].join(":");
+    return this.box.encrypt(plain);
   }
 
   private decrypt(blob: string): string {
-    const key = this.loadKey();
-    const [ivB64, tagB64, dataB64] = blob.split(":");
-    if (!ivB64 || !tagB64 || !dataB64) throw new Error("corrupted password_enc field");
-    const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivB64, "base64"));
-    decipher.setAuthTag(Buffer.from(tagB64, "base64"));
-    return Buffer.concat([decipher.update(Buffer.from(dataB64, "base64")), decipher.final()]).toString("utf8");
+    return this.box.decrypt(blob);
   }
 }

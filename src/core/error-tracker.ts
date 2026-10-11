@@ -8,7 +8,8 @@ export type ModuleName =
   | "monitor"
   | "config"
   | "db"
-  | "telegram";
+  | "telegram"
+  | "credentials";
 
 export interface ModuleError {
   module: ModuleName;
