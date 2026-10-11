@@ -493,23 +493,33 @@ export class TelegramController {
   async textMessage(ctx: Context): Promise<void> {
     const app = this.app;
     const text = ctx.message?.text;
-    if (!text || text.startsWith("/")) return;
+    if (!text) return;
     const state = this.st(ctx.from!.id);
 
     if (state.serverWizard) {
+      if (text.startsWith("/")) return;
       await this.handleServerWizard(ctx, text);
       return;
     }
     if (state.projectWizard) {
-      state.projectWizard = undefined;
+      // Project paths are absolute and therefore begin with '/'.  The old
+      // generic "ignore commands" guard discarded every valid Linux path
+      // before it reached registerProject.
+      if (text === "/cancel") return;
+      if (text.startsWith("/") && !text.slice(1).includes("/")) {
+        await ctx.reply("📁 I am waiting for an absolute project path. Send e.g. /srv/app, or /cancel first.");
+        return;
+      }
       const hostId = this.hostIdForUser(ctx.from!.id);
       if (hostId === null) {
         await ctx.reply("🔌 No server connected. Run /addserver first.");
         return;
       }
-      await this.registerProject(ctx, hostId, text.trim());
+      const registered = await this.registerProject(ctx, hostId, text.trim());
+      if (registered) state.projectWizard = undefined;
       return;
     }
+    if (text.startsWith("/")) return;
     if (state.wizard?.step === "task") {
       await this.finishWizard(ctx, text);
       return;
@@ -1027,19 +1037,23 @@ export class TelegramController {
   }
 
   // ---------- project registration ----------
-  private async registerProject(ctx: Context, hostId: number, rawPath: string): Promise<void> {
+  /** Returns true when registration has completed (including an existing row). */
+  private async registerProject(ctx: Context, hostId: number, rawPath: string): Promise<boolean> {
     const app = this.app;
     const uid = ctx.from!.id;
     const host = resolveHost(app, uid, hostId);
-    if (!host) return this.deny(ctx);
+    if (!host) {
+      await this.deny(ctx);
+      return false;
+    }
     const path = rawPath.replace(/\/+$/, "");
     if (!path.startsWith("/") || path.length < 2) {
       await ctx.reply("❌ Path must be absolute on the server (e.g. /srv/app).");
-      return;
+      return false;
     }
     if (/[\x00-\x1f]/.test(path)) {
       await ctx.reply("❌ Invalid characters in path.");
-      return;
+      return false;
     }
 
     // Do not use app.runner here: it is the long-lived transport used by
@@ -1048,7 +1062,7 @@ export class TelegramController {
     const exists = await app.serverMode.execOnHost(hostId, "test", ["-d", path]);
     if (exists.code !== 0) {
       await ctx.reply(`❌ Directory not found on the server: ${path}\n(${exists.stderr.slice(0, 200)})`);
-      return;
+      return false;
     }
 
     const dup = app.db
@@ -1057,7 +1071,7 @@ export class TelegramController {
       .find((p) => p.root.replace(/\/+$/, "") === path);
     if (dup) {
       await ctx.reply(`ℹ️ Already registered as project #${dup.id} "${dup.name}".`);
-      return;
+      return true;
     }
 
     const repoCheck = await app.serverMode.execOnHost(
@@ -1071,6 +1085,7 @@ export class TelegramController {
       `📁 Project #${project.id} "${project.name}" registered → ${path}\n` +
         (isRepo ? "Git repository: ✅ yes" : "⚠️ Not a git repository — /git will not work for sessions here."),
     );
+    return true;
   }
 
   // ---------- task logs ----------
