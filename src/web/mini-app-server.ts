@@ -1,6 +1,6 @@
 import http from "node:http";
 import { App } from "../core/container";
-import { OutputHub } from "./output-hub";
+import { OutputHub, storedHistoryLines } from "./output-hub";
 import { TerminalService } from "./terminal-service";
 import { validateInitData } from "./telegram-init-data";
 import { MINI_APP_HTML } from "./mini-app-page";
@@ -275,10 +275,20 @@ export class MiniAppServer {
     switch (`${req.method} ${p}`) {
       case "GET /api/session":
         return this.sessionDetail(uid, id, res);
+      case "GET /api/session/history":
+        return this.history(id, res);
       case "GET /api/session/events":
         return this.stream(uid, id, url, res, "agent");
       case "GET /api/terminal/events":
         return this.stream(uid, id, url, res, "shell");
+      case "POST /api/session/delete":
+        return this.action(uid, res, async () => {
+          // ONE delete path shared with the bot (ownership already enforced by
+          // the central gate above): stop agent + drop shell + stored history
+          // all happen inside SessionManager.remove via its deletion hooks.
+          await this.app.sessions.remove(id);
+          return { ok: true, deleted: id };
+        });
       case "POST /api/session/input":
         return this.action(uid, res, async () => {
           const body = await this.readBody(req);
@@ -406,6 +416,20 @@ export class MiniAppServer {
       lines,
       last_seq: lines.length ? lines[lines.length - 1]!.seq : 0,
       terminal: this.terminals.status(id),
+    });
+  }
+
+  /**
+   * Stored output history from the PERSISTED event stream (last 50 lines,
+   * chronological). Agent + system lines live in session_events; shell pane
+   * output is live-only (never persisted) exactly as in the Telegram views.
+   */
+  private history(id: number, res: http.ServerResponse): void {
+    this.json(res, 200, {
+      lines: storedHistoryLines(this.app.db.listEvents(id, 500), 50).map((l) => ({
+        ...l,
+        text: this.scrub(l.text),
+      })),
     });
   }
 

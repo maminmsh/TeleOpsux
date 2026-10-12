@@ -168,6 +168,11 @@ async function buildHarness(webappUrl = "https://mini.example.com/teleops") {
     (t) => credentials.redactAll(redactSecrets(t)),
   );
   const terminals = new TerminalService(app, hub);
+  // same wiring as main.ts: the shared deletion path cleans the web layer
+  sessions.onDeleted((id) => {
+    terminals.drop(id);
+    hub.forget(id);
+  });
   const server = new MiniAppServer(app, hub, terminals);
   const { port } = await server.listen();
 
@@ -339,9 +344,11 @@ describe("id-guessing is not authorization", () => {
       const b = h.mk(USER_B);
       const probes: [string, string, unknown?][] = [
         ["GET", `/api/session?id=${a.id}`],
+        ["GET", `/api/session/history?id=${a.id}`],
         ["GET", `/api/session/events?id=${a.id}&after=0`],
         ["POST", `/api/session/input?id=${a.id}`, { text: "hi" }],
         ["POST", `/api/session/stop?id=${a.id}`],
+        ["POST", `/api/session/delete?id=${a.id}`],
         ["POST", `/api/terminal/start?id=${a.id}`],
         ["POST", `/api/terminal/input?id=${a.id}`, { text: "id" }],
         ["GET", `/api/session?id=${b.id + 99999}`], // unknown id
@@ -351,8 +358,9 @@ describe("id-guessing is not authorization", () => {
         assert.ok(r.status === 403 || r.status === 400, `${p} must refuse, got ${r.status}`);
         assert.ok(r.text.includes(DENY_MESSAGE), `${p} → generic deny`);
       }
-      // nothing touched A's resources
+      // nothing touched A's resources; the delete probe deleted nothing
       assert.equal(h.runner.argv.length, 0);
+      assert.ok(h.db.getSession(a.id));
     } finally {
       await h.close();
     }
@@ -638,6 +646,89 @@ describe("lifecycle + creation", () => {
   });
 });
 
+// ---------- 9b. delete + stored history ----------
+describe("session delete and stored history", () => {
+  it("owner delete kills agent + shell panes and removes every stored row", async () => {
+    const h = await buildHarness();
+    try {
+      const s = h.mk(USER_A);
+      h.db.setStatus(s.id, "WORKING");
+      h.db.addMessage({ session_id: s.id, direction: "USER_TO_AGENT", content: "hi" });
+      h.db.createTaskLog({
+        session_id: s.id, project_id: null, remote_path: "/x.log", task: null, status: "STARTED",
+      });
+      await req(h, `/api/terminal/start?id=${s.id}`, USER_A, "POST");
+      const r = await req(h, `/api/session/delete?id=${s.id}`, USER_A, "POST");
+      assert.equal(r.status, 200);
+      assert.equal(h.db.getSession(s.id), undefined);
+      assert.equal(h.db.listTaskLogs({ session_id: s.id }).length, 0, "task_logs FK rows gone");
+      assert.equal(h.db.listEvents(s.id, 10).length, 0, "event rows incl. the stop event gone");
+      // real teardown ran: agent pane AND the dedicated shell pane were killed
+      assert.ok(h.runner.argv.some(
+        (a) => a[0] === "kill-session" && a[a.indexOf("-t") + 1] === `teleops-${s.id}`));
+      assert.ok(h.runner.argv.some(
+        (a) => a[0] === "kill-session" && a[a.indexOf("-t") + 1] === `teleops-term-${s.id}`));
+      const list = await req(h, "/api/sessions", USER_A);
+      assert.deepEqual(list.json.sessions.map((x: any) => x.id), []);
+      const det = await req(h, `/api/session?id=${s.id}`, USER_A);
+      assert.equal(det.status, 403);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("deleting a stopped session without a terminal still works (idempotent teardown)", async () => {
+    const h = await buildHarness();
+    try {
+      const s = h.mk(USER_A); // status CREATED — stop() transitions are skipped
+      const r = await req(h, `/api/session/delete?id=${s.id}`, USER_A, "POST");
+      assert.equal(r.status, 200);
+      assert.equal(h.db.getSession(s.id), undefined);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("history: last 50 stored lines in chronological order, secrets scrubbed", async () => {
+    const h = await buildHarness();
+    try {
+      const s = h.mk(USER_A);
+      for (let i = 1; i <= 60; i++)
+        h.bus.emit({ type: "SESSION_OUTPUT", session_id: s.id, payload: { chunk: `line ${i}` } });
+      h.db.setStatus(s.id, "FINISHED");
+      h.bus.emit({ type: "SESSION_FINISHED", session_id: s.id });
+      const r = await req(h, `/api/session/history?id=${s.id}`, USER_A);
+      assert.equal(r.status, 200);
+      const lines = r.json.lines;
+      assert.equal(lines.length, 50);
+      assert.equal(lines[0].text, "line 12");
+      assert.equal(lines[48].text, "line 60");
+      assert.equal(lines[49].source, "system");
+      assert.equal(lines[49].text, "session finished");
+      h.bus.emit({
+        type: "SESSION_OUTPUT", session_id: s.id, payload: { chunk: "password=hunter2" },
+      });
+      const r2 = await req(h, `/api/session/history?id=${s.id}`, USER_A);
+      assert.ok(!r2.text.includes("hunter2"), "history must pass the scrub pipeline");
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("page shows the three per-session actions: live, last 50 lines, delete", async () => {
+    const h = await buildHarness();
+    try {
+      const page = await fetch(url(h, "/"), { signal: AbortSignal.timeout(5000) });
+      const html = await page.text();
+      for (const probe of ["vlive", "vhist", "vdel", "Last 50 lines", "Delete",
+        "/api/session/history", "/api/session/delete"])
+        assert.ok(html.includes(probe), `page missing ${probe}`);
+    } finally {
+      await h.close();
+    }
+  });
+});
+
 // ---------- 10. cleanup + telegram compatibility ----------
 describe("resource cleanup and bot integration", () => {
   it("server.close() terminates open SSE streams (no leaked listeners)", async () => {
@@ -671,12 +762,16 @@ describe("resource cleanup and bot integration", () => {
       assert.ok(btn, "web_app button missing");
       assert.match(btn.web_app.url, /session=\d+$/);
       assert.ok(btn.web_app.url.startsWith("https://mini.example.com/teleops"));
+      // the trio: live button + last 50 lines + delete
+      const texts = raw.inline_keyboard.flat().map((b: any) => b.text).join("|");
+      assert.match(texts, /Last 50 lines/);
+      assert.match(texts, /Delete session/);
     } finally {
       await h.close();
     }
   });
 
-  it("no webapp.url configured → no Mini App button anywhere (feature off)", async () => {
+  it("no webapp.url configured → no web_app button anywhere (Mini App off)", async () => {
     const h = await buildHarness();
     h.app.config.webapp.url = "";
     try {
@@ -692,7 +787,98 @@ describe("resource cleanup and bot integration", () => {
       };
       (controller as any).st(ADMIN).wizard = { step: "task", agent: "shell" };
       await (controller as any).finishWizard(ctx, "t");
-      assert.equal(replies[0].kb, undefined);
+      const btns = replies[0].kb.inline_keyboard.flat();
+      assert.ok(!btns.some((b: any) => b.web_app), "web_app button must stay hidden");
+      // bot-side actions remain available without the Mini App
+      assert.ok(btns.some((b: any) => String(b.text).includes("Last 50 lines")));
+      assert.ok(btns.some((b: any) => String(b.text).includes("Delete session")));
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+// ---------- 11. telegram trio: history + delete callbacks ----------
+describe("telegram session trio (history / confirm / delete)", () => {
+  function cbCtx(uid: number, data: string) {
+    const replies: { text: string; kb?: any }[] = [];
+    return {
+      from: { id: uid },
+      chat: { id: 1000 + uid },
+      message: { text: "" },
+      callbackQuery: { data, id: "c" },
+      replies,
+      reply: async (text: string, opts?: any) => {
+        replies.push({ text, kb: opts?.reply_markup });
+        return { message_id: 1 };
+      },
+      editMessageText: async (text: string) => {
+        replies.push({ text });
+      },
+      answerCallbackQuery: async () => undefined,
+    };
+  }
+
+  it("non-owner: hist50, delreq and del all get the generic deny; session untouched", async () => {
+    const h = await buildHarness();
+    try {
+      const a = h.mk(USER_A);
+      const controller = new TelegramController(h.app);
+      for (const d of [`hist50:${a.id}`, `delreq:${a.id}`, `del:${a.id}`]) {
+        const ctx = cbCtx(USER_B, d);
+        await (controller as any).handleCallback(ctx);
+        assert.deepEqual(ctx.replies.map((r) => r.text), [DENY_MESSAGE], `${d} must deny`);
+      }
+      assert.ok(h.db.getSession(a.id));
+      assert.equal(h.runner.argv.length, 0);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("owner: hist50 renders stored lines; delreq confirms; del removes panes + history", async () => {
+    const h = await buildHarness();
+    try {
+      const s = h.mk(USER_A);
+      h.db.setStatus(s.id, "WORKING");
+      h.bus.emit({ type: "SESSION_OUTPUT", session_id: s.id, payload: { chunk: "hello stored" } });
+      const controller = new TelegramController(h.app);
+
+      const c1 = cbCtx(USER_A, `hist50:${s.id}`);
+      await (controller as any).handleCallback(c1);
+      assert.match(c1.replies[0].text, /\[AGENT\] hello stored/);
+
+      const c2 = cbCtx(USER_A, `delreq:${s.id}`);
+      await (controller as any).handleCallback(c2);
+      assert.match(c2.replies[0].text, /Cannot be undone/);
+      const btns = c2.replies[0].kb.inline_keyboard.flat();
+      assert.ok(btns.some((b: any) => b.callback_data === `del:${s.id}`));
+      assert.ok(btns.some((b: any) => b.callback_data === `sess:${s.id}`));
+
+      const c3 = cbCtx(USER_A, `del:${s.id}`);
+      await (controller as any).handleCallback(c3);
+      assert.match(c3.replies[0].text, /deleted/);
+      assert.equal(h.db.getSession(s.id), undefined);
+      assert.equal(h.db.listEvents(s.id, 10).length, 0);
+      // the agent pane was killed through the real SessionManager stop path
+      assert.ok(h.runner.argv.some(
+        (a) => a[0] === "kill-session" && a[a.indexOf("-t") + 1] === `teleops-${s.id}`));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("selected session page (sess:) carries the trio: live web_app + Last 50 + Delete", async () => {
+    const h = await buildHarness();
+    try {
+      const s = h.mk(USER_A);
+      const controller = new TelegramController(h.app);
+      const ctx = cbCtx(USER_A, `sess:${s.id}`);
+      await (controller as any).handleCallback(ctx);
+      const flat = ctx.replies[0]?.kb?.inline_keyboard?.flat?.() ?? [];
+      assert.ok(flat.some((b: any) => b.web_app), "live Mini App button missing");
+      assert.ok(flat.some((b: any) => b.callback_data === `hist50:${s.id}`));
+      assert.ok(flat.some((b: any) => b.callback_data === `delreq:${s.id}`));
     } finally {
       await h.close();
     }

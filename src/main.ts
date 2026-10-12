@@ -132,6 +132,12 @@ async function main(): Promise<void> {
   const scrub = (t: string): string => credentials.redactAll(redactSecrets(t));
   const hub = new OutputHub(bus, scrub);
   const terminals = new TerminalService(app, hub);
+  // single deletion path shared by bot + Mini App: when a session is removed,
+  // its shell pane is killed and its live ring forgotten
+  sessions.onDeleted((id) => {
+    terminals.drop(id);
+    hub.forget(id);
+  });
   let webapp: MiniAppServer | null = null;
   if (config.webapp.enabled && config.webapp.url && config.telegram.botToken) {
     webapp = new MiniAppServer(app, hub, terminals);

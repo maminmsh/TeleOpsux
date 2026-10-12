@@ -309,6 +309,14 @@ live terminal, alongside — not replacing — the chat commands.
   chronological order; after a TeleOps restart the stored pane tail seeds the
   buffer. Reconnects resume at the last seen `seq` — no duplicates, no gaps
   (within the 500-line ring retention).
+- Every selected session offers the same three actions: **🖥 Live** (streaming
+  terminal), **📜 Last 50 lines** (stored output read from the persisted
+  event log, read-only — shell-pane lines are live-only and were never
+  stored) and **🗑 Delete** (confirm first; stops the agent, kills both
+  panes, then removes the session row and all its stored history). In the
+  Telegram bot the same trio sits on each session page: the 🖥 Open Session
+  Terminal button (live Mini App), a new 📜 Last 50 lines button and a new
+  🗑 Delete session button (owner/admin only, irreversible).
 - Two strictly separated input modes:
   - **💬 Agent Chat** → `SessionManager.sendInput` → the agent pane
     (`teleops-<id>`), the same path as the bot chat.

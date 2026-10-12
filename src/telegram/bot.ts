@@ -27,6 +27,7 @@ import {
   resolveTaskLog,
 } from "../auth/access";
 import { liveOutputTarget, notificationChatIds } from "../notify/routing";
+import { storedHistoryLines } from "../web/output-hub";
 import {
   CREDENTIAL_REQUIRED_MESSAGE,
   CredentialRequiredError,
@@ -118,20 +119,25 @@ export class TelegramController {
   }
 
   /**
-   * "Open Session Terminal" button for the Live Mini App. Telegram's Bot API
-   * does NOT let a bot open a Mini App by itself — the user taps this button.
-   * The session id in the URL is only a NON-SECRET selector; the server
-   * authorizes with initData + ownership on every call. When webapp.url is
-   * not configured the button (and the whole API) stays hidden.
+   * The three per-session actions shown right where a session is selected:
+   * 🖥 Live (Mini App terminal), 📜 Last 50 lines (stored output) and
+   * 🗑 Delete. Telegram's Bot API does NOT let a bot open a Mini App by
+   * itself — the user taps the button; that is the compliant maximum. The
+   * session id in the URL is only a NON-SECRET selector; the server
+   * authorizes with initData + ownership on every call. The web_app button
+   * disappears entirely when webapp.url is not configured; the other two
+   * actions are plain bot callbacks and always available.
    */
-  private terminalKb(sessionId: number): InlineKeyboard | undefined {
+  private sessionKb(sessionId: number): InlineKeyboard {
+    const kb = new InlineKeyboard();
     const cfg = this.app.config.webapp;
-    if (!cfg.enabled || !cfg.url) return undefined;
-    const sep = cfg.url.includes("?") ? "&" : "?";
-    return new InlineKeyboard().webApp(
-      "🖥 Open Session Terminal",
-      `${cfg.url}${sep}session=${sessionId}`,
-    );
+    if (cfg.enabled && cfg.url) {
+      const sep = cfg.url.includes("?") ? "&" : "?";
+      kb.webApp("🖥 Live Session Terminal", `${cfg.url}${sep}session=${sessionId}`).row();
+    }
+    kb.text("📜 Last 50 lines", `hist50:${sessionId}`)
+      .text("🗑 Delete session", `delreq:${sessionId}`);
+    return kb;
   }
 
   /** Raw argument string of a `bot.command` update (grammy exposes it as a string). */
@@ -389,7 +395,7 @@ export class TelegramController {
       `💬 Chatting with ${s.agent_type} #${s.id} (${s.status})\n` +
         `Send any message to forward it to the agent.\n\n` +
         `Recent output:\n${this.clip(this.scrub(out)) || "(no output yet)"}`,
-      { reply_markup: this.terminalKb(sessionId) },
+      { reply_markup: this.sessionKb(sessionId) },
     );
   }
 
@@ -1284,7 +1290,7 @@ export class TelegramController {
         `✅ Session #${created.id} created\nAgent: ${w.agent}\nProject: ${
           project?.name ?? "(adhoc)"
         }\nStatus: 🟢 working\nChatting now — send messages to talk to the agent.`,
-        { reply_markup: this.terminalKb(created.id) },
+        { reply_markup: this.sessionKb(created.id) },
       );
     } catch (e) {
       await this.fail(ctx, e);
@@ -1659,6 +1665,58 @@ export class TelegramController {
 
     if (data.startsWith("sess:")) {
       await this.enterChat(ctx, Number(parts[1]));
+      return ack();
+    }
+
+    if (data.startsWith("hist50:")) {
+      const id = Number(parts[1]);
+      // the id is a selector only — ownership is re-resolved server-side
+      if (!resolveSession(app, uid, id)) {
+        await this.deny(ctx);
+        return ack();
+      }
+      const lines = storedHistoryLines(app.db.listEvents(id, 500), 50).map(
+        (l) => `[${l.source.toUpperCase()}] ${this.scrub(l.text)}`,
+      );
+      await ctx.reply(
+        lines.length
+          ? this.clip(lines.join("\n")) || "(stored output is empty)"
+          : "No stored output for this session yet.",
+      );
+      return ack();
+    }
+
+    if (data.startsWith("delreq:")) {
+      const id = Number(parts[1]);
+      const s = resolveSession(app, uid, id);
+      if (!s) {
+        await this.deny(ctx);
+        return ack();
+      }
+      await ctx.reply(
+        `⚠️ Delete session #${id} (${this.scrub(s.name)})?\nThis stops the agent, ` +
+          `closes the shell and removes ALL stored history. Cannot be undone.`,
+        {
+          reply_markup: new InlineKeyboard()
+            .text("✅ Yes, delete", `del:${id}`)
+            .text("⬅ Cancel", `sess:${id}`),
+        },
+      );
+      return ack();
+    }
+
+    if (data.startsWith("del:")) {
+      const id = Number(parts[1]);
+      const s = resolveSession(app, uid, id);
+      if (!s) {
+        await this.deny(ctx);
+        return ack();
+      }
+      // ONE delete path shared with the Mini App: stop agent, remove row +
+      // stored history, kill shell pane + live ring via SessionManager hooks
+      await app.sessions.remove(id);
+      if (this.st(uid).activeSession === id) this.st(uid).activeSession = undefined;
+      await ctx.reply(`🗑 Session #${id} deleted together with its history.`);
       return ack();
     }
 

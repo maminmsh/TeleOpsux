@@ -280,6 +280,30 @@ export class SessionManager {
     this.bus.emit({ type: "SESSION_STOPPED", session_id: sessionId });
   }
 
+  /** UI-layer cleanups to run when a session is deleted (shell panes, rings). */
+  private deletionHooks: ((sessionId: number) => void)[] = [];
+  onDeleted(fn: (sessionId: number) => void): void {
+    this.deletionHooks.push(fn);
+  }
+
+  /**
+   * THE delete path for every UI (Telegram bot and Mini App alike):
+   * best-effort agent stop (dead/crashed statuses have no legal STOPPING
+   * transition), then remove the row plus all stored history, then let the
+   * web layers drop their per-session state. Ownership checks are the
+   * CALLER's job — this method trusts them.
+   */
+  async remove(sessionId: number): Promise<void> {
+    try {
+      await this.stop(sessionId);
+    } catch {
+      /* not transitionable or transport already gone — nothing left to kill;
+         deletion must still proceed so the user is never stuck */
+    }
+    this.db.deleteSession(sessionId);
+    for (const fn of this.deletionHooks) fn(sessionId);
+  }
+
   async resume(sessionId: number): Promise<SessionRecord> {
     const session = this.mustGet(sessionId);
     const name = String(sessionId);

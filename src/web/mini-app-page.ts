@@ -66,6 +66,9 @@ button:disabled { opacity:.45; }
 #out .s-shell { color:var(--shell); font-weight:600; margin-right:6px; }
 #out .s-system { color:var(--system); font-weight:600; margin-right:6px; }
 #controls { display:flex; gap:6px; padding:8px 12px 0; flex-wrap:wrap; flex:0 0 auto; }
+#views { display:flex; gap:6px; padding:8px 12px 0; flex-wrap:wrap; flex:0 0 auto; }
+#views button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
+#vdel { color:var(--err); }
 #modes { display:flex; gap:6px; padding:8px 12px 0; flex:0 0 auto; }
 #modes button.on { background:var(--accent); border-color:var(--accent); color:#fff; }
 #sendrow { display:flex; gap:6px; padding:8px 12px calc(10px + env(safe-area-inset-bottom)); flex:0 0 auto; }
@@ -97,6 +100,11 @@ button:disabled { opacity:.45; }
   </section>
   <section id="detailview" class="view">
     <div id="meta"></div>
+    <div id="views">
+      <button id="vlive" class="on">🖥 Live</button>
+      <button id="vhist">📜 Last 50 lines</button>
+      <button id="vdel">🗑 Delete</button>
+    </div>
     <pre id="out"></pre>
     <div id="modes">
       <button id="mchat" class="on">💬 Agent Chat</button>
@@ -124,7 +132,7 @@ else document.body.classList.add("theme-light");
 
 var H = { "X-Telegram-Init-Data": (tg && tg.initData) || "", "Content-Type": "application/json" };
 var $ = function (id) { return document.getElementById(id); };
-var state = { id: null, mode: "chat", agentAfter: 0, termAfter: 0,
+var state = { id: null, view: "live", mode: "chat", agentAfter: 0, termAfter: 0,
   agentAbort: null, termAbort: null, termActive: false, pinned: true, backoff: 1000 };
 var MAX_LINES = 800;
 
@@ -247,8 +255,9 @@ function closeStream(which) {
 }
 
 // The reader loop ends when the stream drops; poll cheaply to revive it.
+// Only the LIVE view keeps streams open — the history view is read-only.
 setInterval(function () {
-  if (state.id == null) return;
+  if (state.id == null || state.view !== "live") return;
   if (!state.agentAbort) openStream("agent");
   if (state.termActive && !state.termAbort) openStream("term");
 }, 3000);
@@ -293,10 +302,10 @@ function showDetailChrome() {
   $("badge").style.display = "";
 }
 function openSession(id) {
-  state.id = id; state.agentAfter = 0; state.termAfter = 0;
+  state.id = id; state.view = "live"; state.agentAfter = 0; state.termAfter = 0;
   closeStream("agent"); closeStream("term");
   banner(null); out.textContent = ""; $("create").classList.remove("on");
-  showDetailChrome();
+  showDetailChrome(); syncViewUI();
   api("/api/session?id=" + id).then(function (j) {
     if (state.id !== id) return;
     $("title").textContent = j.name;
@@ -319,6 +328,40 @@ function openSession(id) {
 }
 
 // ---------- detail actions ----------
+function syncViewUI() {
+  var hist = state.view === "hist";
+  $("vlive").classList.toggle("on", !hist);
+  $("vhist").classList.toggle("on", hist);
+  ["modes", "controls", "sendrow", "hint"].forEach(function (id) {
+    $(id).style.display = hist ? "none" : "";
+  });
+}
+$("vlive").onclick = function () {
+  if (state.id == null || state.view === "live") return;
+  openSession(state.id); // refetch snapshot + reopen streams at coherent cursors
+};
+$("vhist").onclick = function () {
+  if (state.id == null || state.view === "hist") return;
+  var myId = state.id;
+  closeStream("agent"); closeStream("term");
+  state.view = "hist"; syncViewUI();
+  out.textContent = "";
+  api("/api/session/history?id=" + myId).then(function (j) {
+    if (state.id !== myId || state.view !== "hist") return;
+    if (!j.lines.length) {
+      addLine("system", new Date().toISOString(), "no stored output for this session");
+      return;
+    }
+    j.lines.forEach(function (l) { addLine(l.source, l.at, l.text); });
+  }).catch(function (e) { banner(e.message); });
+};
+$("vdel").onclick = function () {
+  if (state.id == null) return;
+  if (!confirm("Delete this session and all its stored history? This cannot be undone.")) return;
+  api("/api/session/delete?id=" + state.id, { method: "POST" })
+    .then(function () { showList(); })
+    .catch(function (e) { banner(e.message); });
+};
 function syncTermUI() {
   $("mterm").classList.toggle("on", state.mode === "term");
   $("mchat").classList.toggle("on", state.mode === "chat");

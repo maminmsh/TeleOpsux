@@ -405,6 +405,21 @@ export class DB {
       .prepare("UPDATE sessions SET owner_telegram_user_id = ? WHERE id = ?")
       .run(ownerTelegramUserId, id);
   }
+  /**
+   * Hard-remove a session and its stored history. task_logs has a real FK to
+   * sessions (foreign_keys=ON) and the other tables have no cascade, so all
+   * child rows are deleted first in one transaction.
+   */
+  deleteSession(id: number): void {
+    const tx = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM task_logs WHERE session_id = ?").run(id);
+      this.db.prepare("DELETE FROM session_messages WHERE session_id = ?").run(id);
+      this.db.prepare("DELETE FROM session_events WHERE session_id = ?").run(id);
+      this.db.prepare("DELETE FROM approvals WHERE session_id = ?").run(id);
+      this.db.prepare("DELETE FROM sessions WHERE id = ?").run(id);
+    });
+    tx();
+  }
   updateSession(
     id: number,
     patch: Partial<

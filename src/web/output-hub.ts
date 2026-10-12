@@ -33,7 +33,7 @@ interface Ring {
   listeners: Set<LineListener>;
 }
 
-const LIFECYCLE_TEXT: Record<string, string> = {
+export const LIFECYCLE_TEXT: Record<string, string> = {
   SESSION_CREATED: "session created",
   SESSION_STARTED: "agent started",
   SESSION_STOPPED: "session stopped",
@@ -42,8 +42,31 @@ const LIFECYCLE_TEXT: Record<string, string> = {
   PROCESS_CRASHED: "agent process crashed",
 };
 
-export class OutputHub {
-  private rings = new Map<number, Ring>();
+/**
+ * Stored output history (last `count` lines, chronological) rebuilt from the
+ * PERSISTED domain events — the same view both the Mini App "Last 50 lines"
+ * and the Telegram button render. db.listEvents returns DESC; shell-pane
+ * output never reaches the bus, so this is agent + system lines only.
+ */
+export function storedHistoryLines(
+  events: DomainEvent[],
+  count = 50,
+): { at: string; source: LineSource; text: string }[] {
+  const lines: { at: string; source: LineSource; text: string }[] = [];
+  for (const e of [...events].reverse()) {
+    if (e.type === "SESSION_OUTPUT") {
+      const chunk = String(e.payload?.chunk ?? "");
+      for (const l of chunk.split("\n"))
+        lines.push({ at: e.created_at, source: "agent", text: l });
+    } else {
+      const t = LIFECYCLE_TEXT[e.type];
+      if (t) lines.push({ at: e.created_at, source: "system", text: t });
+    }
+  }
+  return lines.slice(-count);
+}
+
+export class OutputHub {  private rings = new Map<number, Ring>();
   private busHandler: (e: DomainEvent) => void;
 
   constructor(

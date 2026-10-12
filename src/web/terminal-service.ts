@@ -154,6 +154,14 @@ export class TerminalService {
     this.kill(sessionId);
   }
 
+  /**
+   * Internal removal for callers that already enforced ownership (the
+   * SessionManager deletion hook) — kills the shell if one is open.
+   */
+  drop(sessionId: number): void {
+    this.kill(sessionId);
+  }
+
   private mustBeLive(userId: number, sessionId: number): Term {
     this.mustOwn(userId, sessionId);
     const t = this.terms.get(sessionId);
