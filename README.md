@@ -67,10 +67,12 @@ src/
   notify/         Notification Engine (rules -> sink) + per-owner routing
   credentials/    per-user API keys: encrypted store + optional PAT probe;
                   the token is entered as a chat reply and deleted after saving
+  web/            Live Session Terminal Mini App: initData auth, output hub,
+                  interactive tmux terminals, API server + embedded page
   telegram/       Telegram view layer (commands, menus, chat, live output)
   main.ts         composition root
 test/             node:test suites (access, migration, routing, bot authz,
-                  credentials)
+                  credentials, mini-app)
 scripts/          smoke/e2e helpers + teleops.service
 config/config.example.yaml
 .env.example
@@ -284,10 +286,79 @@ confirmation tap (the confirmation must exist in server-side state, so replayed
 callback data alone cannot delete anything). Deleting one user's key never
 touches another user's sessions. Admins see statuses only (`/credentials`).
 
+## Live Session Terminal Mini App (webapp)
+
+A Telegram Mini App (WebApp) for watching and steering sessions with a real
+live terminal, alongside — not replacing — the chat commands.
+
+**What it does**
+- Every session created by the wizard gets a prominent **🖥 Open Session
+  Terminal** button (also on `/sessions` → session chat entry). Telegram's Bot
+  API never lets a bot *force-open* a Mini App — the user taps the button;
+  that is the compliant maximum.
+- Opening without a session (no `?session=` / start param) shows the sessions
+  list: live statuses (the real state-machine values), agent, project, last
+  activity, active-first ordering — scoped by the same ownership rules as the
+  bot. Creating a session inside the Mini App goes through the real
+  `SessionManager.create/start` gates and then jumps directly to its page.
+- The session page streams live output chunk-by-chunk over **SSE** (the page
+  consumes it with fetch-streaming so the auth header can ride along), with
+  `AGENT` / `SHELL` / `SYSTEM` sources, timestamps, a fixed-height scrollable
+  pane, auto-scroll pinned to the bottom (releases when you scroll up), copy,
+  stop/resume and the real status badge. Initial view = last 50 lines in
+  chronological order; after a TeleOps restart the stored pane tail seeds the
+  buffer. Reconnects resume at the last seen `seq` — no duplicates, no gaps
+  (within the 500-line ring retention).
+- Two strictly separated input modes:
+  - **💬 Agent Chat** → `SessionManager.sendInput` → the agent pane
+    (`teleops-<id>`), the same path as the bot chat.
+  - **🖥 Linux Terminal** → a dedicated persistent tmux shell
+    (`teleops-term-<id>`) opened on the *session's current transport* (the
+    active SSH host when the project is remote — commands never leak onto
+    the TeleOps control box by accident) at the project cwd. Real interactive
+    state: `cd` persists, `npm test` keeps running, Ctrl+C is delivered as an
+    actual tmux key (fixed allowlist), long jobs survive page disconnects
+    (reap after 30 min idle). It never touches the agent pane, and shell
+    input never merges into agent stdin.
+- The shell runs as the service account TeleOps itself connects with. No
+  sudo, no root escalation is ever added.
+
+**Security model**
+- Every `/api/*` call carries Telegram `initData` in the
+  `X-Telegram-Init-Data` header, HMAC-verified against the bot token
+  (`src/web/telegram-init-data`). The raw auth data is never in URLs, logs or
+  error messages; the page's own `user.id` is ignored as identity proof.
+- Session ids from the client are untrusted selectors: every operation
+  re-resolves them through the central auth layer (`src/auth/access`) —
+  including on every live-stream push. Foreign and unknown ids return the
+  same generic refusal.
+- All output is scrubbed (`redactSecrets` + stored-key redaction) before it
+  leaves the server; confidential tokens are never displayed.
+- SSE listeners/timers are torn down on client disconnect and server
+  shutdown; per-user fixed-window rate limits apply.
+
+**Enabling it**
+1. `TELEOPS_WEBAPP_URL=https://<public-host>/teleops/` (or `webapp.url` in
+   config). Register the same domain/app with @BotFather.
+2. Run a TLS reverse proxy for the loopback API port (8718) that passes the
+   `X-Telegram-Init-Data` header and does NOT buffer SSE
+   (`proxy_buffering off;` + `proxy_read_timeout` ≥ 60s in nginx). A
+   non-loopback bind without an https:// URL is refused at startup.
+3. Restart TeleOps. Without a URL the feature is fully inert (no server,
+   no button).
+
+*Honesty notes:* live delivery follows the existing capture-diff pipeline
+(`sessions.heartbeat_interval_seconds` for the agent pane, ~700 ms polling for
+shell panes) — chunk-by-chunk push, but that is the architecture's native
+cadence, not per-byte PTY streaming. Browser rendering and the real
+Telegram client tap-through are not covered by automated tests; the suite
+drives the actual HTTP API with correctly signed initData and a tmux-fake
+transport.
+
 ## Tests
 
 ```bash
-npm test          # node:test + tsx — access, migration, routing, bot authz, credentials
+npm test          # node:test + tsx — access, migration, routing, bot authz, credentials, mini-app
 npm run typecheck
 npm run build
 ```

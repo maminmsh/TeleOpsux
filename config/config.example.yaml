@@ -92,6 +92,24 @@ credentials:
   validate_pat: true
   pat_validation_timeout_seconds: 25
 
+# Live Session Terminal Mini App (Telegram WebApp, src/web).
+webapp:
+  # Master switch. Even when true, nothing runs until url is set — the bot
+  # then shows the "🖥 Open Session Terminal" button.
+  enabled: true
+  # The API server speaks plain HTTP; keep it loopback-only and terminate TLS
+  # in your reverse proxy (nginx/caddy) which must forward the
+  # X-Telegram-Init-Data header unchanged. A non-loopback bind without an
+  # https:// url is REFUSED at startup.
+  host: 127.0.0.1
+  port: 8718
+  # Public https:// URL of the Mini App page — the SAME domain you register
+  # with @BotFather (/mybots → Bot Settings → Menu Button / web app).
+  # Prefer the TELEOPS_WEBAPP_URL env var.
+  url: ""
+  # Telegram initData older than this is refused (replay protection).
+  init_data_max_age_seconds: 3600
+
 # Remote server (SSH) — added at runtime via /addserver; these are connection tuning knobs.
 ssh:
   exec_timeout_seconds: 20

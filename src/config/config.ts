@@ -55,6 +55,21 @@ export interface Config {
     validate_pat: boolean;
     pat_validation_timeout_seconds: number;
   };
+  /** Live Session Terminal Mini App (src/web). */
+  webapp: {
+    enabled: boolean;
+    /** Bind address of the API server — keep 127.0.0.1 behind a TLS proxy. */
+    host: string;
+    port: number;
+    /**
+     * Public https:// URL of the Mini App (the origin Telegram opens).
+     * Must match the domain registered with BotFather. Empty = no
+     * "Open Session Terminal" button and the API server does not start.
+     */
+    url: string;
+    /** Telegram initData older than this is refused (replay protection). */
+    init_data_max_age_seconds: number;
+  };
   paths: {
     database_file: string;
     session_root: string;
@@ -111,6 +126,13 @@ const DEFAULTS: Config = {
     validate_pat: true,
     pat_validation_timeout_seconds: 25,
   },
+  webapp: {
+    enabled: true,
+    host: "127.0.0.1",
+    port: 8718,
+    url: "",
+    init_data_max_age_seconds: 3600,
+  },
   paths: {
     database_file: "./data/teleops.db",
     session_root: "./data/sessions",
@@ -160,6 +182,11 @@ export function loadConfig(configFile?: string): Config {
   merged.paths.log_root = process.env.LOG_ROOT ?? merged.paths.log_root;
   merged.paths.secret_key_file =
     process.env.TELEOPS_SECRET_KEY_FILE ?? merged.paths.secret_key_file;
+  merged.webapp.url = process.env.TELEOPS_WEBAPP_URL ?? merged.webapp.url;
+  merged.webapp.enabled =
+    process.env.TELEOPS_WEBAPP_ENABLED !== undefined
+      ? !["0", "false", "no"].includes(process.env.TELEOPS_WEBAPP_ENABLED.toLowerCase())
+      : merged.webapp.enabled;
 
   return merged;
 }

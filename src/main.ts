@@ -20,6 +20,10 @@ import { ServerModeService } from "./server/server-mode";
 import { App } from "./core/container";
 import { basename } from "./shared/paths";
 import { TelegramController } from "./telegram/bot";
+import { OutputHub } from "./web/output-hub";
+import { TerminalService } from "./web/terminal-service";
+import { MiniAppServer } from "./web/mini-app-server";
+import { redactSecrets } from "./auth/access";
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -123,6 +127,29 @@ async function main(): Promise<void> {
     );
   }
 
+  // Live Session Terminal Mini App — shares the EventBus, SessionManager and
+  // SSH transport; every request is initData-authenticated server-side.
+  const scrub = (t: string): string => credentials.redactAll(redactSecrets(t));
+  const hub = new OutputHub(bus, scrub);
+  const terminals = new TerminalService(app, hub);
+  let webapp: MiniAppServer | null = null;
+  if (config.webapp.enabled && config.webapp.url && config.telegram.botToken) {
+    webapp = new MiniAppServer(app, hub, terminals);
+    try {
+      const bound = await webapp.listen();
+      logs.system.info(
+        `Mini App API listening on ${bound.host}:${bound.port} (public: ${config.webapp.url})`,
+      );
+    } catch (e) {
+      webapp = null;
+      logs.system.warn(`Mini App server disabled: ${(e as Error).message}`);
+    }
+  } else if (config.webapp.enabled && !config.webapp.url) {
+    logs.system.warn(
+      "webapp.url not set (TELEOPS_WEBAPP_URL) — the Open Session Terminal button is hidden.",
+    );
+  }
+
   if (config.security.allowed_users.length === 0)
     logs.system.warn("no allowed_users configured — nobody can use the bot. Set security.allowed_users.");
   if (config.security.admin_users === undefined && config.security.allowed_users.length > 1)
@@ -137,6 +164,9 @@ async function main(): Promise<void> {
       app.monitor.stop();
       app.serverMode.connection?.close();
       sessions.shutdown();
+      if (webapp) await webapp.close();
+      terminals.shutdown();
+      hub.stop();
       if (telegram) await telegram.stop();
       logs.system.info("telegram bot stopped");
     } finally {

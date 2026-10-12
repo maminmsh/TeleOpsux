@@ -117,6 +117,23 @@ export class TelegramController {
     return s;
   }
 
+  /**
+   * "Open Session Terminal" button for the Live Mini App. Telegram's Bot API
+   * does NOT let a bot open a Mini App by itself — the user taps this button.
+   * The session id in the URL is only a NON-SECRET selector; the server
+   * authorizes with initData + ownership on every call. When webapp.url is
+   * not configured the button (and the whole API) stays hidden.
+   */
+  private terminalKb(sessionId: number): InlineKeyboard | undefined {
+    const cfg = this.app.config.webapp;
+    if (!cfg.enabled || !cfg.url) return undefined;
+    const sep = cfg.url.includes("?") ? "&" : "?";
+    return new InlineKeyboard().webApp(
+      "🖥 Open Session Terminal",
+      `${cfg.url}${sep}session=${sessionId}`,
+    );
+  }
+
   /** Raw argument string of a `bot.command` update (grammy exposes it as a string). */
   private cmdArg(ctx: Context): string {
     return typeof ctx.match === "string" ? ctx.match.trim() : "";
@@ -372,6 +389,7 @@ export class TelegramController {
       `💬 Chatting with ${s.agent_type} #${s.id} (${s.status})\n` +
         `Send any message to forward it to the agent.\n\n` +
         `Recent output:\n${this.clip(this.scrub(out)) || "(no output yet)"}`,
+      { reply_markup: this.terminalKb(sessionId) },
     );
   }
 
@@ -1266,6 +1284,7 @@ export class TelegramController {
         `✅ Session #${created.id} created\nAgent: ${w.agent}\nProject: ${
           project?.name ?? "(adhoc)"
         }\nStatus: 🟢 working\nChatting now — send messages to talk to the agent.`,
+        { reply_markup: this.terminalKb(created.id) },
       );
     } catch (e) {
       await this.fail(ctx, e);

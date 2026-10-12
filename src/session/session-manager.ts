@@ -113,6 +113,20 @@ export class SessionManager {
     return this.host !== null;
   }
 
+  /**
+   * The CURRENT tmux transport (follows attachHost hot-swap). The live
+   * terminal Mini App opens its shells through this so a remote-host project
+   * can never accidentally run commands on the TeleOps control server.
+   */
+  get tmuxTransport(): Tmux {
+    return this.tmux;
+  }
+
+  /** Active host id, or null in local mode — terminal binding check. */
+  get currentHostId(): number | null {
+    return this.host?.hostId ?? null;
+  }
+
   /** Whether the tmux binary is reachable on the current transport. */
   async tmuxAvailable(): Promise<boolean> {
     return this.tmux.available();
