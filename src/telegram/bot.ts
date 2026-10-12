@@ -37,6 +37,8 @@ interface Wizard {
   step: "project" | "agent" | "task";
   project_id?: number;
   agent?: string;
+  /** finishWizard is mid-launch — a second task message must not double-start. */
+  busy?: boolean;
 }
 
 interface ServerWizard {
@@ -50,6 +52,14 @@ interface UserState {
   serverWizard?: ServerWizard;
   projectWizard?: boolean;
   liveMessageId?: number;
+  /**
+   * The ONE persistent navigation message. Menu screens are EDITED in place
+   * (never re-sent), so browsing never floods the chat. Recorded by
+   * chat+message so edits survive even when the tap came from elsewhere.
+   */
+  dashboard?: { chatId: number; messageId: number; key: string };
+  /** Keys of screens we came from — ⬅ Back pops and re-renders them. */
+  navStack?: string[];
   /** Waiting for the second tap on "delete my credential". */
   pendingKeyDelete?: boolean;
   /** "Set token" tapped — the next message is treated as the token. */
@@ -116,6 +126,188 @@ export class TelegramController {
       this.state.set(userId, s);
     }
     return s;
+  }
+
+  // ---------- dashboard navigation (one edited message) ----------
+
+  /** Telegram replies "message is not modified" when content is identical — not an error. */
+  private static isNotModified(e: unknown): boolean {
+    const err = e as { error_code?: number; description?: string };
+    return (
+      err?.error_code === 400 &&
+      (err.description ?? "").toLowerCase().includes("not modified")
+    );
+  }
+
+  /**
+   * Render a navigation screen WITHOUT flooding the chat: edit the tapped
+   * message (the dashboard the button lives on) when possible, else edit the
+   * stored dashboard message, else send one new message and store it. The
+   * stored chat+message id makes "Back" and refresh EDIT the same bubble.
+   */
+  private async screen(
+    ctx: Context,
+    key: string,
+    text: string,
+    kb?: InlineKeyboard,
+  ): Promise<void> {
+    const state = this.st(ctx.from!.id);
+    const opts = kb ? { reply_markup: kb } : undefined;
+    const cbMsg = ctx.callbackQuery && "message" in ctx.callbackQuery
+      ? ctx.callbackQuery.message
+      : undefined;
+    if (cbMsg) {
+      try {
+        await ctx.editMessageText(text, opts);
+        state.dashboard = { chatId: cbMsg.chat.id, messageId: cbMsg.message_id, key };
+        return;
+      } catch (e) {
+        // "message is not modified" means the dashboard ALREADY shows this
+        // screen — done. Anything else (edited too old? not ours to edit?)
+        // falls through to the recorded/refresh path below.
+        if (TelegramController.isNotModified(e)) {
+          state.dashboard = {
+            chatId: cbMsg.chat.id,
+            messageId: cbMsg.message_id,
+            key,
+          };
+          return;
+        }
+      }
+    }
+    const dash = state.dashboard;
+    if (dash) {
+      try {
+        await this.bot.api.editMessageText(dash.chatId, dash.messageId, text, opts);
+        dash.key = key;
+        return;
+      } catch (e) {
+        if (TelegramController.isNotModified(e)) {
+          dash.key = key;
+          return;
+        }
+        state.dashboard = undefined; // deleted / no longer editable
+      }
+    }
+    const chatId = ctx.chat?.id ?? dash?.chatId;
+    if (!chatId) return;
+    try {
+      const sent = await ctx.reply(text, opts);
+      state.dashboard = { chatId, messageId: sent.message_id, key };
+    } catch {
+      /* chat unavailable (bot blocked) — nothing sane left to do */
+    }
+  }
+
+  /**
+   * Navigate to a screen key. Keeps a per-user back-stack of the screens we
+   * came from; "main" is the root and clears it. Non-dashboard keys (wizards,
+   * forms) are simply not handled here.
+   */
+  private async navigate(ctx: Context, uid: number, key: string): Promise<void> {
+    const state = this.st(uid);
+    if (key === "logs") {
+      await this.showLogs(ctx, state.activeSession);
+      return;
+    }
+    const ADMIN_SCREENS = new Set(["server", "processes", "health", "alerts", "settings"]);
+    if (ADMIN_SCREENS.has(key) && !(await this.requireAdmin(ctx))) return;
+    const spec = await this.screenSpec(ctx, uid, key);
+    if (!spec) return;
+    const prev = state.dashboard?.key;
+    if (key === "main") state.navStack = [];
+    else if (prev && prev !== key)
+      state.navStack = [...(state.navStack ?? []), prev].slice(-12);
+    await this.screen(ctx, key, spec.text, spec.kb);
+  }
+
+  /** One Back step: pop the stored screen key and re-render it (default: main). */
+  private async goBack(ctx: Context, uid: number): Promise<void> {
+    const state = this.st(uid);
+    const stack = state.navStack ?? [];
+    const prev = stack.at(-1) ?? "main";
+    state.navStack = stack.slice(0, -1);
+    // Re-render WITHOUT pushing — we are stepping back, not deeper.
+    const spec = await this.screenSpec(ctx, uid, prev);
+    if (spec) {
+      await this.screen(ctx, prev, spec.text, spec.kb);
+      return;
+    }
+    await this.navigate(ctx, uid, prev);
+  }
+
+  /** Text + keyboard for a dashboard screen key. */
+  private async screenSpec(
+    ctx: Context,
+    uid: number,
+    key: string,
+  ): Promise<{ text: string; kb?: InlineKeyboard } | undefined> {
+    const app = this.app;
+    const back = (kb: InlineKeyboard): InlineKeyboard => {
+      kb.row().text("⬅ Back", "back");
+      return kb;
+    };
+    switch (key) {
+      case "main":
+        return {
+          text: "🤖 AI COMMAND CENTER\nChoose an option:",
+          kb: this.mainMenu(isAdminUser(app, uid)),
+        };
+      case "sessions":
+        return this.sessionsSpec(uid);
+      case "hosts":
+        return this.hostsSpec(uid);
+      case "projects": {
+        const ps = isAdminUser(app, uid)
+          ? app.db.listProjects()
+          : app.db.listProjectsForOwner(uid);
+        const lines = ps.map((p) => {
+          const host = p.host_id ? app.hosts.getHost(p.host_id) : undefined;
+          return `${p.id}. ${p.name}  [${host ? `remote @ ${host.host}` : "local"}]  ${p.root}`;
+        });
+        return {
+          text: "📁 Projects\n\n" + (lines.join("\n") || "none — /addproject to register"),
+          kb: back(new InlineKeyboard().text("➕ Add Project", "nav:addproject")),
+        };
+      }
+      case "server": {
+        const counts = this.sessionCounts(uid);
+        const full = app.monitor.fullReport
+          ? await app.monitor.fullReport().catch(() => null)
+          : null;
+        return {
+          text: full
+            ? serverStatusExtended(full, counts)
+            : serverStatus(await app.monitor.metrics(), counts),
+          kb: back(new InlineKeyboard()),
+        };
+      }
+      case "processes":
+        return {
+          text: processesList(await app.monitor.topProcesses()),
+          kb: back(new InlineKeyboard()),
+        };
+      case "health":
+        return { text: this.healthText(), kb: back(new InlineKeyboard()) };
+      case "alerts":
+        return {
+          text: "Use /alerts for the current alert + approval summary.",
+          kb: back(new InlineKeyboard()),
+        };
+      case "settings":
+        return {
+          text:
+            "⚙️ Settings\nmax_concurrent: " +
+            app.config.sessions.max_concurrent +
+            "\nagents: " +
+            app.adapters.ids().join(", "),
+          kb: back(new InlineKeyboard()),
+        };
+      case "qoderkey":
+        return this.qoderKeySpec(uid);
+      default:
+        return undefined;
+    }
   }
 
   /**
@@ -363,8 +555,7 @@ export class TelegramController {
     return kb;
   }
 
-  private async sessionsOverview(ctx: Context): Promise<void> {
-    const uid = ctx.from!.id;
+  private sessionsSpec(uid: number): { text: string; kb: InlineKeyboard } {
     const admin = isAdminUser(this.app, uid);
     const sessions = admin
       ? this.app.db.listSessions()
@@ -376,10 +567,12 @@ export class TelegramController {
     );
     const kb = new InlineKeyboard();
     for (const s of sessions) kb.text(`${s.id}. ${s.name}`, `sess:${s.id}`).row();
-    kb.text("⬅ Back", "menu:main");
-    await ctx.reply(text.length > 4000 ? text.slice(0, 4000) : text, {
-      reply_markup: kb,
-    });
+    kb.text("⬅ Back", "back");
+    return { text: text.length > 4000 ? text.slice(0, 4000) : text, kb };
+  }
+
+  private async sessionsOverview(ctx: Context): Promise<void> {
+    await this.navigate(ctx, ctx.from!.id, "sessions");
   }
 
   private async enterChat(ctx: Context, sessionId: number): Promise<void> {
@@ -389,13 +582,23 @@ export class TelegramController {
       await this.deny(ctx);
       return;
     }
-    this.st(ctx.from!.id).activeSession = sessionId;
+    const uid = ctx.from!.id;
+    const state = this.st(uid);
+    state.activeSession = sessionId;
     const out = await this.app.sessions.capture(sessionId, 40);
-    await ctx.reply(
+    const key = `chat:${sessionId}`;
+    const prev = state.dashboard?.key;
+    if (prev && prev !== key)
+      state.navStack = [...(state.navStack ?? []), prev].slice(-12);
+    const kb = this.sessionKb(sessionId);
+    kb.row().text("⬅ Back", "back");
+    await this.screen(
+      ctx,
+      key,
       `💬 Chatting with ${s.agent_type} #${s.id} (${s.status})\n` +
         `Send any message to forward it to the agent.\n\n` +
         `Recent output:\n${this.clip(this.scrub(out)) || "(no output yet)"}`,
-      { reply_markup: this.sessionKb(sessionId) },
+      kb,
     );
   }
 
@@ -893,25 +1096,33 @@ export class TelegramController {
   }
 
   // ---------- per-user servers ----------
-  private async hostsOverview(ctx: Context): Promise<void> {
-    const uid = ctx.from!.id;
+  private hostsSpec(uid: number): { text: string; kb: InlineKeyboard } {
     const hosts = isAdminUser(this.app, uid)
       ? this.app.db.listHosts()
       : this.app.db.listHostsForOwner(uid);
+    const kb = new InlineKeyboard();
     if (!hosts.length) {
-      await ctx.reply("🖥 No servers registered for you yet. Use /addserver.");
-      return;
+      kb.text("➕ Add Server", "nav:addserver").row().text("⬅ Back", "back");
+      return {
+        text: "🖥 No servers registered for you yet. Use /addserver.",
+        kb,
+      };
     }
     const active = this.hostIdForUser(uid);
-    const kb = new InlineKeyboard();
     const lines = hosts.map((h) => {
       const mine = h.owner_telegram_user_id === uid ? "you" : h.owner_telegram_user_id == null ? "legacy" : `owner ${h.owner_telegram_user_id}`;
       kb.text(`${h.id}. ${h.name}`, `hostuse:${h.id}`).text("🗑", `hostdel:${h.id}`).row();
       return `${h.id === active ? "⭐" : "  "} ${h.id}. ${h.name} — ${h.username}@${h.host}:${h.port}  (${h.visibility === "shared" ? "shared" : `private · ${mine}`})`;
     });
-    await ctx.reply("🖥 MY SERVERS\n\n" + lines.join("\n") + "\n\n⭐ = your active server", {
-      reply_markup: kb,
-    });
+    kb.text("⬅ Back", "back");
+    return {
+      text: "🖥 MY SERVERS\n\n" + lines.join("\n") + "\n\n⭐ = your active server",
+      kb,
+    };
+  }
+
+  private async hostsOverview(ctx: Context): Promise<void> {
+    await this.navigate(ctx, ctx.from!.id, "hosts");
   }
 
   private async handleHostUse(ctx: Context, hostId: number): Promise<void> {
@@ -1187,7 +1398,7 @@ export class TelegramController {
         await ctx.reply("📜 No task logs yet. Logs are recorded when a session starts in a registered project.");
         return;
       }
-      await ctx.reply(await this.taskLogText(latest), { reply_markup: this.logButtons(latest) });
+      await this.screen(ctx, "logs", await this.taskLogText(latest), this.logButtons(latest));
       return;
     }
     const session = this.ownedSession(ctx, sessionId);
@@ -1211,12 +1422,14 @@ export class TelegramController {
           `logview:${t.id}`,
         )
         .row();
-    kb.text("📟 Live screen", `act:logs:${sessionId}`);
+    kb.text("📟 Live screen", `act:logs:${sessionId}`).row().text("⬅ Back", "back");
     const current = logs[0]!;
-    await ctx.reply(
+    await this.screen(
+      ctx,
+      `logs:${sessionId}`,
       `📜 LOGS — session #${sessionId} (${logs.length} files)\n\nShowing the newest:\n\n` +
         (await this.taskLogText(current)),
-      { reply_markup: kb },
+      kb,
     );
   }
 
@@ -1245,6 +1458,18 @@ export class TelegramController {
     const uid = ctx.from!.id;
     const w = this.st(uid).wizard;
     if (!w?.agent) return;
+    // start() now really spawns + verifies the process (seconds of latency);
+    // a repeated/double-sent task message while that is in flight must NOT
+    // create a second session or re-emit the lifecycle events.
+    if (w.busy) {
+      await ctx.reply("⏳ That task is already launching — one moment.");
+      return;
+    }
+    this.st(uid).wizard = { ...w, busy: true };
+    const release = () => {
+      const cur = this.st(uid).wizard;
+      if (cur) this.st(uid).wizard = { ...cur, busy: false };
+    };
     // the wizard's stored project id is re-authorized here, not trusted blindly
     const project =
       w.project_id != null ? resolveProject(this.app, uid, w.project_id) : undefined;
@@ -1265,6 +1490,7 @@ export class TelegramController {
       this.app.adapters.get(w.agent)?.credentialEnvVar &&
       !this.app.credentials.hasCredential(uid)
     ) {
+      release();
       await ctx.reply(
         CREDENTIAL_REQUIRED_MESSAGE +
           "\n\nRun /qoderkey, tap “Set token” and reply with your token. " +
@@ -1286,13 +1512,15 @@ export class TelegramController {
       this.st(uid).activeSession = created.id;
       const branch = await this.app.git.currentBranch(cwd);
       if (branch) this.app.db.updateSession(created.id, { branch });
+      const now = this.app.db.getSession(created.id);
       await ctx.reply(
         `✅ Session #${created.id} created\nAgent: ${w.agent}\nProject: ${
           project?.name ?? "(adhoc)"
-        }\nStatus: 🟢 working\nChatting now — send messages to talk to the agent.`,
+        }\nStatus: ${now?.status ?? "working"}\nChatting now — send messages to talk to the agent.`,
         { reply_markup: this.sessionKb(created.id) },
       );
     } catch (e) {
+      release();
       await this.fail(ctx, e);
     }
   }
@@ -1385,8 +1613,7 @@ export class TelegramController {
    * Outside that explicit flow a token is still refused in chat; inside it the
    * bot saves the token encrypted and deletes both messages immediately.
    */
-  private async qoderKeyCommand(ctx: Context): Promise<void> {
-    const uid = ctx.from!.id;
+  private qoderKeySpec(uid: number): { text: string; kb: InlineKeyboard } {
     const status = this.app.credentials.status(uid);
     const lines = [
       "🔑 QODER CREDENTIAL",
@@ -1410,8 +1637,12 @@ export class TelegramController {
     const kb = new InlineKeyboard();
     kb.text(status === "missing" ? "🔐 Set token" : "🔄 Replace token", "keyset").row();
     if (status !== "missing") kb.text("🗑 Delete my credential", "keydel").row();
-    kb.text("⬅ Back", "menu:main");
-    await ctx.reply(lines.join("\n"), { reply_markup: kb });
+    kb.text("⬅ Back", "back");
+    return { text: lines.join("\n"), kb };
+  }
+
+  private async qoderKeyCommand(ctx: Context): Promise<void> {
+    await this.navigate(ctx, ctx.from!.id, "qoderkey");
   }
 
   /** Ask for the token as a chat reply; the next message is treated as the token. */
@@ -1555,70 +1786,39 @@ export class TelegramController {
     const app = this.app;
     const parts = data.split(":");
 
+    // Navigation NEVER stacks new messages: every screen below is rendered by
+    // EDITING the single recorded dashboard message (screen()); ⬅ Back pops the
+    // per-user stack. Every branch acknowledges the callback.
     if (data === "menu:main") {
-      await ctx.editMessageText("🤖 AI COMMAND CENTER\nChoose an option:", {
-        reply_markup: this.mainMenu(isAdminUser(app, uid)),
-      });
+      await this.navigate(ctx, uid, "main");
+      return ack();
+    }
+
+    if (data === "back") {
+      await this.goBack(ctx, uid);
       return ack();
     }
 
     if (data.startsWith("nav:")) {
-      switch (parts[1]) {
-        case "sessions":
-          await this.sessionsOverview(ctx);
-          break;
-        case "hosts":
-          await this.hostsOverview(ctx);
-          break;
-        case "projects": {
-          const ps = isAdminUser(app, uid)
-            ? app.db.listProjects()
-            : app.db.listProjectsForOwner(uid);
-          const lines = ps.map((p) => {
-            const host = p.host_id ? app.hosts.getHost(p.host_id) : undefined;
-            return `${p.id}. ${p.name}  [${host ? `remote @ ${host.host}` : "local"}]  ${p.root}`;
-          });
-          await ctx.reply("📁 Projects\n\n" + (lines.join("\n") || "none — /addproject to register"));
-          break;
-        }
-        case "server": {
-          if (!(await this.requireAdmin(ctx))) break;
-          const counts = this.sessionCounts(uid);
-          const full = app.monitor.fullReport
-            ? await app.monitor.fullReport().catch(() => null)
-            : null;
-          await ctx.reply(
-            full ? serverStatusExtended(full, counts) : serverStatus(await app.monitor.metrics(), counts),
-          );
-          break;
-        }
-        case "processes":
-          if (!(await this.requireAdmin(ctx))) break;
-          await ctx.reply(processesList(await app.monitor.topProcesses()));
-          break;
-        case "logs":
-          await this.showLogs(ctx, this.st(uid).activeSession);
-          break;
-        case "health":
-          if (!(await this.requireAdmin(ctx))) break;
-          await ctx.reply(this.healthText());
-          break;
-        case "alerts":
-          if (!(await this.requireAdmin(ctx))) break;
-          await ctx.reply("Use /alerts for the current alert + approval summary.");
-          break;
-        case "settings":
-          if (!(await this.requireAdmin(ctx))) break;
-          await ctx.reply(
-            "⚙️ Settings\nmax_concurrent: " +
-              app.config.sessions.max_concurrent +
-              "\nagents: " +
-              app.adapters.ids().join(", "),
-          );
-          break;
-        case "qoderkey":
-          await this.qoderKeyCommand(ctx);
-          break;
+      const key = parts[1] ?? "";
+      const DASHBOARD = new Set([
+        "main",
+        "sessions",
+        "hosts",
+        "projects",
+        "server",
+        "processes",
+        "health",
+        "alerts",
+        "settings",
+        "qoderkey",
+        "logs",
+      ]);
+      if (DASHBOARD.has(key)) {
+        await this.navigate(ctx, uid, key);
+        return ack();
+      }
+      switch (key) {
         case "git":
           await ctx.reply("Open 🌿 Git from a session, or use /git <session id>.");
           break;

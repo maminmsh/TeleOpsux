@@ -67,13 +67,25 @@ class FakeRunner implements ExecRunner {
   argv: string[][] = [];
   names = new Set<string>();
   panes = new Map<string, string>();
+  /** Binaries `command -v` (launch preflight) cannot find. */
+  missingBins = new Set<string>();
+  /** Panes whose process exited: tmux name -> exit code (remain-on-exit). */
+  deadPanes = new Map<string, number>();
 
   private target(args: string[]): string {
     return args[args.indexOf("-t") + 1] ?? "";
   }
-  async exec(_cmd: string, args: string[]): Promise<ExecResult> {
+  async exec(cmd: string, args: string[]): Promise<ExecResult> {
     this.argv.push(args);
     const ok = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
+    const gone = (): ExecResult => ({ code: 1, stdout: "", stderr: "no session" });
+    if (cmd === "sh" && args[0] === "-lc") {
+      // SessionManager preflight: sh -lc 'command -v "$1"' <argv0> <bin>
+      const bin = args[args.length - 1]!;
+      return this.missingBins.has(bin)
+        ? { code: 1, stdout: "", stderr: `${bin}: not found` }
+        : ok(`${bin.startsWith("/") ? bin : "/usr/local/bin/" + bin}\n`);
+    }
     switch (args[0]) {
       case "-V":
         return ok("tmux 3.4\n");
@@ -82,7 +94,11 @@ class FakeRunner implements ExecRunner {
       case "new-session": {
         const s = args[args.indexOf("-s") + 1];
         this.names.add(s);
-        this.panes.set(s, `${s}$ `);
+        // with a pane COMMAND the agent is the pane process (no shell prompt);
+        // without one it is the interactive terminal shell.
+        const ci = args.indexOf("-c");
+        const isAgent = args.length > ci + 2;
+        this.panes.set(s, isAgent ? "" : `${s}$ `);
         return ok();
       }
       case "send-keys": {
@@ -99,12 +115,17 @@ class FakeRunner implements ExecRunner {
       }
       case "capture-pane":
         return ok(this.panes.get(this.target(args)) ?? "");
-      case "display-message":
-        return ok("4321\n");
+      case "display-message": {
+        const t = this.target(args);
+        if (!this.names.has(t)) return gone();
+        const dead = this.deadPanes.get(t);
+        return ok(dead === undefined ? "0;;4321" : `1;${dead};4321`);
+      }
       case "kill-session": {
         const t = this.target(args);
         this.names.delete(t);
         this.panes.delete(t);
+        this.deadPanes.delete(t);
         return ok();
       }
       case "pipe-pane":
@@ -489,6 +510,9 @@ describe("two input modes", () => {
     const h = await buildHarness();
     try {
       const s = h.mk(USER_A, "/srv/app");
+      // input modes only accept a RUNNING agent — a CREATED session must
+      // never forward chat text into an untouched shell (spec §3)
+      await h.sessions.start(s.id);
       // chat mode
       const chat = await req(h, `/api/session/input?id=${s.id}`, USER_A, "POST", {
         text: "hello agent",

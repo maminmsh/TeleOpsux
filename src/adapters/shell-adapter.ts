@@ -9,10 +9,14 @@ export class ShellAdapter extends BaseAdapter {
     super();
   }
 
+  /** Preflight resolves + validates this before any session starts. */
+  get executable(): string {
+    return this.shell;
+  }
+
   launchCommand(options: CreateSessionOptions): string {
     // A plain interactive shell in the project directory.
-    void options;
-    return this.shell;
+    return options.resolvedCommand ?? this.shell;
   }
 
   initialInput(options: CreateSessionOptions): string | undefined {

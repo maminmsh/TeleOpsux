@@ -15,9 +15,12 @@ class GenericAdapter extends BaseAdapter {
     this.id = id;
     this.name = id.charAt(0).toUpperCase() + id.slice(1);
   }
-  launchCommand(options: CreateSessionOptions): string {
-    void options;
+  /** Preflight resolves + validates this before any session starts. */
+  get executable(): string {
     return this.command;
+  }
+  launchCommand(options: CreateSessionOptions): string {
+    return options.resolvedCommand ?? this.command;
   }
   initialInput(options: CreateSessionOptions): string | undefined {
     return options.task;

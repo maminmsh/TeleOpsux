@@ -4,11 +4,14 @@ import { Tmux } from "./tmux";
 import { AdapterRegistry } from "../adapters/registry";
 import { LogHub } from "../logger/logger";
 import { Config } from "../config/config";
-import { assertTransition } from "./state-machine";
+import { assertTransition, ACTIVE_STATUSES } from "./state-machine";
 import { ProjectFiles } from "./project-files";
 import type { ExecRunner } from "../exec/exec-runner";
 import { LocalRunner } from "../exec/local-runner";
 import type { ModuleErrorTracker } from "../core/error-tracker";
+import { tailLines } from "../adapters/base-adapter";
+import { redactSecrets } from "../auth/access";
+import type { CreateSessionOptions } from "../adapters/agent-adapter";
 import {
   CredentialRequiredError,
   CredentialService,
@@ -18,6 +21,40 @@ import {
   SessionRecord,
   SessionStatus,
 } from "../shared/types";
+
+/**
+ * The genuinely-new text between two capturePane snapshots. A pane capture is a
+ * SCROLLING window, so the previous snapshot is NOT a prefix of the next — a
+ * naive `next.slice(prev.length)` re-emits old lines every time the pane
+ * scrolls (the source of duplicated output at the event layer). Strategy:
+ * identical → ""; plain append → the tail; scrolled window → the suffix/prefix
+ * overlap between the two windows; redraw-only (spinner/status line) → the
+ * positional line diff, which re-emits only the lines that actually changed.
+ */
+export function outputDelta(prev: string, next: string): string {
+  if (prev === next) return "";
+  if (!prev.length) return next;
+  if (next.startsWith(prev)) return next.slice(prev.length);
+  const p = prev.split("\n");
+  const n = next.split("\n");
+  const max = Math.min(p.length, n.length);
+  for (let k = max; k >= 1; k--) {
+    let overlap = true;
+    for (let i = 0; i < k; i++) {
+      if (p[p.length - k + i] !== n[i]) {
+        overlap = false;
+        break;
+      }
+    }
+    if (overlap) return n.slice(k).join("\n");
+  }
+  const changed: string[] = [];
+  for (let i = 0; i < n.length; i++) {
+    const line = n[i] as string;
+    if (line !== p[i]) changed.push(line);
+  }
+  return changed.join("\n");
+}
 
 interface Runtime {
   startedAtMs: number;
@@ -203,69 +240,210 @@ export class SessionManager {
     if (needsCred && !this.creds?.hasCredential(session.owner_telegram_user_id))
       throw new CredentialRequiredError();
 
+    // Idempotent restart: while a live agent pane already exists, a repeated
+    // start (double-tap, resume race) must NOT spawn a second process or
+    // re-emit the "agent started" lifecycle line.
+    if (
+      this.runtime.has(sessionId) &&
+      ACTIVE_STATUSES.includes(session.status) &&
+      (await this.tmux.isAlive(String(sessionId)))
+    )
+      return this.mustGet(sessionId);
+
     if (!(await this.tmux.available()))
       throw new Error(
         "tmux is not installed — persistent sessions require tmux. Install it and retry.",
       );
 
+    // Restart is only legal from CREATED/STOPPED/FINISHED/CRASHED. If a live-
+    // looking status (WORKING/ERROR/…) has NO alive pane behind it (crash the
+    // poller hasn't observed yet, or resume() of a dead pane), reflect reality
+    // by dropping to STOPPED first, then STARTING is valid.
+    if (
+      !["CREATED", "STOPPED", "FINISHED", "CRASHED", "STARTING"].includes(session.status)
+    )
+      this.db.setStatus(sessionId, "STOPPED");
+
     this.transition(sessionId, "STARTING");
     const name = String(sessionId);
-
-    if (!(await this.tmux.exists(name))) {
-      let secretFilePath: string | undefined;
-      if (needsCred) {
-        const uid = session.owner_telegram_user_id!;
-        const key = this.creds!.revealForLaunch(uid);
-        if (!key) {
-          this.creds!.markInvalid(uid);
-          throw new CredentialRequiredError();
-        }
-        secretFilePath = this.credentialFilePath(sessionId);
-        await this.stageCredentialFile(secretFilePath, key);
+    let secretFilePath: string | undefined;
+    try {
+      // LAUNCH PREFLIGHT: resolve the agent executable ON THE SESSION HOST
+      // before anything is declared started. The resolved ABSOLUTE path is used
+      // for the pane command, so the tmux server's differing PATH can never
+      // produce "sh: 1: exec: qoder: not found" inside a live interactive shell.
+      let resolvedCommand: string | undefined;
+      if (adapter.executable) {
+        const res = await this.resolveExecutable(adapter.executable);
+        if (!res.ok) return this.failStart(sessionId, res.error);
+        resolvedCommand = res.path;
       }
-      const opts = {
+
+      // clear a dead remain-on-exit pane from a previous attempt before restart
+      if ((await this.tmux.exists(name)) && !(await this.tmux.isAlive(name)))
+        await this.tmux.killSession(name);
+
+      const opts: CreateSessionOptions = {
         cwd: session.cwd,
         project: session.name,
         task: task ?? undefined,
-        secretFilePath,
+        resolvedCommand,
       };
-      try {
+      if (!(await this.tmux.exists(name))) {
+        if (needsCred) {
+          const uid = session.owner_telegram_user_id!;
+          const key = this.creds!.revealForLaunch(uid);
+          if (!key) {
+            this.creds!.markInvalid(uid);
+            throw new CredentialRequiredError();
+          }
+          secretFilePath = this.credentialFilePath(sessionId);
+          await this.stageCredentialFile(secretFilePath, key);
+          opts.secretFilePath = secretFilePath;
+        }
+        // the launch command IS the pane command — when the agent dies, the
+        // pane dies with it; nothing survives to swallow later input
         await this.tmux.newSession(name, session.cwd, adapter.launchCommand(opts));
-      } catch (e) {
-        if (secretFilePath) await this.removeCredentialFile(secretFilePath);
-        throw e;
+        await this.setupTaskLog(session, task);
       }
-      await this.setupTaskLog(session, task);
-    }
 
-    const pid = await this.tmux.panePid(name);
-    this.db.updateSession(sessionId, { pid });
-    const opts = { cwd: session.cwd, project: session.name, task: task ?? undefined };
-    const initial = adapter.initialInput?.(opts);
-    if (initial) {
-      // give the TUI a moment to render before typing the task
-      await new Promise((r) => setTimeout(r, 1500));
-      await this.tmux.sendInput(name, initial);
-      this.db.addMessage({
-        session_id: sessionId,
-        direction: "USER_TO_AGENT",
-        content: initial,
-        source: "telegram",
+      // WORKING is reported only after the process survived the immediate-
+      // failure window. remain-on-exit keeps a crashed pane's FINAL output and
+      // exit code readable, so the real error is surfaced, never guessed.
+      await new Promise((r) => setTimeout(r, SessionManager.STARTUP_VERIFY_MS));
+      let pane = await this.tmux.paneStatus(name);
+      if (!pane || pane.dead) {
+        const out = await this.tmux.capturePane(name, 60);
+        return this.failStart(
+          sessionId,
+          `the ${adapter.name} process exited immediately` +
+            (pane?.exitCode != null ? ` (exit code ${pane.exitCode})` : "") +
+            (out.trim() ? ` — last output: ${this.scrubTail(out)}` : " — it produced no output"),
+          { output: out, secretFilePath },
+        );
+      }
+      this.db.updateSession(sessionId, { pid: pane.pid });
+
+      const initial = adapter.initialInput?.(opts);
+      if (initial) {
+        // give the TUI a moment to render before typing the task
+        await new Promise((r) => setTimeout(r, 1500));
+        pane = await this.tmux.paneStatus(name);
+        if (!pane || pane.dead) {
+          const out = await this.tmux.capturePane(name, 60);
+          return this.failStart(
+            sessionId,
+            `the ${adapter.name} process exited before receiving the task` +
+              (out.trim() ? ` — last output: ${this.scrubTail(out)}` : ""),
+            { output: out, secretFilePath },
+          );
+        }
+        await this.tmux.sendInput(name, initial);
+        this.db.addMessage({
+          session_id: sessionId,
+          direction: "USER_TO_AGENT",
+          content: initial,
+          source: "telegram",
+        });
+      }
+
+      this.transition(sessionId, "WORKING");
+      this.runtime.set(sessionId, {
+        startedAtMs: Date.now(),
+        lastActivityMs: Date.now(),
+        lastOutput: "",
+        status: "WORKING",
+        idleReported: false,
+        credentialReported: false,
       });
+      this.bus.emit({ type: "SESSION_STARTED", session_id: sessionId });
+      this.ensurePolling();
+      return this.mustGet(sessionId);
+    } catch (e) {
+      if (secretFilePath) await this.removeCredentialFile(secretFilePath);
+      if (this.db.getSession(sessionId)?.status === "STARTING") {
+        // a frozen STARTING is as misleading as a false WORKING — record why
+        this.db.updateSession(sessionId, {
+          waiting_reason: String((e as Error).message).slice(0, 500),
+        });
+        this.safeTransition(sessionId, "ERROR");
+        this.runtime.delete(sessionId);
+      }
+      throw e;
     }
+  }
 
-    this.transition(sessionId, "WORKING");
-    this.runtime.set(sessionId, {
-      startedAtMs: Date.now(),
-      lastActivityMs: Date.now(),
-      lastOutput: "",
-      status: "WORKING",
-      idleReported: false,
-      credentialReported: false,
+  /** Milliseconds to wait for an instant spawn failure before declaring WORKING. */
+  private static readonly STARTUP_VERIFY_MS = 900;
+
+  /**
+   * Record a REAL startup failure: persist the actionable message (never a
+   * fake WORKING), keep the session + diagnostics for inspection, clean the
+   * staged credential and the dead pane, notify, then throw the same message
+   * so the calling UI shows it directly.
+   */
+  private failStart(
+    sessionId: number,
+    message: string,
+    opts: { output?: string; secretFilePath?: string } = {},
+  ): never {
+    if (opts.secretFilePath) void this.removeCredentialFile(opts.secretFilePath);
+    const patch: Parameters<DB["updateSession"]>[1] = { waiting_reason: message.slice(0, 500) };
+    if (opts.output && opts.output.trim()) patch.last_output = opts.output.slice(-4000);
+    this.db.updateSession(sessionId, patch);
+    this.safeTransition(sessionId, "ERROR");
+    this.runtime.delete(sessionId);
+    void this.tmux.killSession(String(sessionId)).catch(() => undefined);
+    this.bus.emit({
+      type: "PROCESS_CRASHED",
+      session_id: sessionId,
+      severity: "CRITICAL",
+      payload: { reason: message },
     });
-    this.bus.emit({ type: "SESSION_STARTED", session_id: sessionId });
-    this.ensurePolling();
-    return this.mustGet(sessionId);
+    throw new Error(message);
+  }
+
+  /**
+   * Resolve the agent executable on the CURRENT session host (local FS or the
+   * attached SSH host). A login shell gives the richest PATH; the ABSOLUTE
+   * path returned is what the pane then execs — the pane itself never relies
+   * on PATH. The binary name comes from operator config (never user text) and
+   * is passed as an ARGUMENT, so it cannot inject shell syntax.
+   */
+  private async resolveExecutable(
+    command: string,
+  ): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
+    // MUST run on the same transport the pane will be created on — that is
+    // where PATH matters (and what the unit-test fakes intercept).
+    const r = await this.tmux.execRunner.exec(
+      "sh",
+      ["-lc", 'command -v "$1"', "teleops-preflight", command],
+      { timeoutMs: 20_000 },
+    );
+    const path = (r.stdout || "").split("\n")[0]?.trim() ?? "";
+    if (r.code === 0 && path.startsWith("/")) return { ok: true, path };
+    const host = this.host ? "the active server" : "this machine";
+    const detail = (r.stderr || "").trim().slice(0, 160);
+    return {
+      ok: false,
+      error:
+        `"${command}" was not found on ${host}, so the agent cannot start. ` +
+        "Install it, or point agents.<id>.command (env QODER_BIN for Qoder) at its absolute path. " +
+        "Note: tmux panes do not inherit an interactive login PATH, so a binary that works " +
+        "when you SSH in can still be missing here." +
+        (detail ? ` Details: ${detail}` : ""),
+    };
+  }
+
+  /** Short, secret-safe excerpt of pane output for error messages. */
+  private scrubTail(output: string): string {
+    const line =
+      tailLines(output, 8)
+        .filter((l) => l.trim())
+        .slice(-2)
+        .join(" / ") || "(empty)";
+    const safe = redactSecrets(line);
+    return (this.creds ? this.creds.redactAll(safe) : safe).slice(0, 300);
   }
 
   async stop(sessionId: number): Promise<void> {
@@ -307,7 +485,9 @@ export class SessionManager {
   async resume(sessionId: number): Promise<SessionRecord> {
     const session = this.mustGet(sessionId);
     const name = String(sessionId);
-    if (await this.tmux.exists(name)) {
+    // isAlive (not exists): with remain-on-exit a dead pane still EXISTS —
+    // only a not-dead pane means the agent is actually still running.
+    if (await this.tmux.isAlive(name)) {
       // tmux session still alive — reconnect bookkeeping only
       const pid = await this.tmux.panePid(name);
       this.db.updateSession(sessionId, { pid });
@@ -320,6 +500,24 @@ export class SessionManager {
   async sendInput(sessionId: number, text: string): Promise<void> {
     this.assertNoCredentialInText(text);
     const session = this.mustGet(sessionId);
+    // AGENT CHAT is for the agent — never for a shell. If no live agent
+    // process is behind this session, the message is REFUSED instead of being
+    // typed into some surviving pane where it would run as a Linux command.
+    const ACCEPTS_INPUT: SessionStatus[] = [
+      "STARTING",
+      "WORKING",
+      "WAITING_INPUT",
+      "WAITING_APPROVAL",
+      "ERROR",
+    ];
+    if (!ACCEPTS_INPUT.includes(session.status))
+      throw new Error(
+        `Session #${sessionId} is ${session.status} — resume/restart it before sending messages.`,
+      );
+    if (!(await this.tmux.isAlive(String(sessionId))))
+      throw new Error(
+        `The agent in session #${sessionId} is no longer running — resume/restart it before sending messages.`,
+      );
     await this.tmux.sendInput(String(sessionId), text);
     this.db.addMessage({
       session_id: sessionId,
@@ -508,7 +706,8 @@ export class SessionManager {
   async recover(): Promise<void> {
     if (!(await this.tmux.available())) return;
     for (const s of this.db.listSessions()) {
-      const live = await this.tmux.exists(String(s.id));
+      // a dead remain-on-exit pane is NOT "live" — isAlive checks the process
+      const live = await this.tmux.isAlive(String(s.id));
       if (
         live &&
         ["STARTING", "WORKING", "WAITING_INPUT", "WAITING_APPROVAL"].includes(
@@ -577,16 +776,33 @@ export class SessionManager {
     const adapter = this.adapters.get(session.agent_type);
     if (!adapter) return;
 
-    const alive = await this.tmux.exists(String(id));
+    // A pane that still EXISTS but has exited (remain-on-exit) is process
+    // death just like a vanished session — treat both as "not alive".
+    const pane = await this.tmux.paneStatus(String(id));
+    const alive = pane !== null && !pane.dead;
     if (!alive) {
       if (rt.status !== "STOPPED" && rt.status !== "FINISHED") {
+        // drain the exited pane's final output (still readable) before ending
+        const out = await this.tmux.capturePane(String(id), 250);
+        const diff = outputDelta(rt.lastOutput, out);
+        if (diff.trim()) {
+          this.logs.session.sessionOutput(id, diff.trim());
+          this.db.updateSession(id, { last_output: out.slice(-4000) });
+          this.bus.emit({
+            type: "SESSION_OUTPUT",
+            session_id: id,
+            payload: { chunk: diff.slice(-2000) },
+          });
+        }
         this.safeTransition(id, "CRASHED");
         this.bus.emit({
           type: "PROCESS_CRASHED",
           session_id: id,
           severity: "CRITICAL",
+          payload: { reason: pane?.dead ? `process exited (code ${pane.exitCode ?? "?"})` : "process not found" },
         });
         this.runtime.delete(id);
+        await this.tmux.killSession(String(id)).catch(() => undefined);
       }
       return;
     }
@@ -594,7 +810,10 @@ export class SessionManager {
     const output = await this.tmux.capturePane(String(id), 250);
     const changed = output !== rt.lastOutput;
     if (changed) {
-      const diff = output.slice(rt.lastOutput.length);
+      // prefix-safe: capture-pane is a scrolling window, so a plain length-
+      // slice re-emits scrolled-off lines (the duplication bug). outputDelta
+      // emits only what genuinely changed.
+      const diff = outputDelta(rt.lastOutput, output);
       if (diff.trim()) this.logs.session.sessionOutput(id, diff.trim());
       rt.lastOutput = output;
       rt.lastActivityMs = Date.now();
@@ -602,11 +821,12 @@ export class SessionManager {
       this.db.updateSession(id, {
         last_output: output.slice(-4000),
       });
-      this.bus.emit({
-        type: "SESSION_OUTPUT",
-        session_id: id,
-        payload: { chunk: diff.slice(-2000) },
-      });
+      if (diff.trim())
+        this.bus.emit({
+          type: "SESSION_OUTPUT",
+          session_id: id,
+          payload: { chunk: diff.slice(-2000) },
+        });
     }
 
     const next = adapter.classifyStatus(output, true);

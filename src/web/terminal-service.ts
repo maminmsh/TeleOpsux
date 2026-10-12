@@ -1,5 +1,6 @@
 import { App } from "../core/container";
 import { OutputHub } from "./output-hub";
+import { outputDelta } from "../session/session-manager";
 import { DENY_MESSAGE, resolveSession } from "../auth/access";
 
 /**
@@ -109,9 +110,13 @@ export class TerminalService {
       throw new Error("tmux is not available on this server — interactive terminal needs it.");
 
     const name = `term-${sessionId}`;
-    // Reuse a shell that survived a TeleOps restart.
-    if (!(await tmux.exists(name)))
-      await tmux.newSession(name, s.cwd);
+    // Reuse a shell that survived a TeleOps restart — but only a LIVE one:
+    // with remain-on-exit a dead pane still exists, and reopening must not
+    // resurrect an exited shell as a "connected" terminal.
+    if (await tmux.exists(name)) {
+      if (!(await tmux.isAlive(name))) await tmux.killSession(name);
+    }
+    if (!(await tmux.exists(name))) await tmux.newSession(name, s.cwd);
     t = {
       name,
       cwd: s.cwd,
@@ -130,6 +135,7 @@ export class TerminalService {
   /** Literal text + Enter — delivered to the SHELL pane only. */
   async sendText(userId: number, sessionId: number, text: string): Promise<void> {
     const t = this.mustBeLive(userId, sessionId);
+    await this.assertNotExited(sessionId, t);
     if (!text) return;
     if (text.length > 4000) throw new Error("Input too long (max 4000 characters).");
     t.lastUsedMs = Date.now();
@@ -144,9 +150,17 @@ export class TerminalService {
     const t = this.mustBeLive(userId, sessionId);
     if (!ALLOWED_KEYS.has(key))
       throw new Error(`Key "${key}" is not allowed.`);
+    await this.assertNotExited(sessionId, t);
     t.lastUsedMs = Date.now();
     this.ensurePolling(sessionId, t);
     await this.app.sessions.tmuxTransport.sendKey(t.name, key);
+  }
+
+  /** Input never goes to a shell that has already exited. */
+  private async assertNotExited(sessionId: number, t: Term): Promise<void> {
+    if (await this.app.sessions.tmuxTransport.isAlive(t.name)) return;
+    this.kill(sessionId);
+    throw new Error("The terminal shell has exited — reopen the terminal.");
   }
 
   async stop(userId: number, sessionId: number): Promise<void> {
@@ -205,12 +219,20 @@ export class TerminalService {
       return;
     }
     const output = await this.app.sessions.tmuxTransport.capturePane(t.name, 250);
-    if (output === t.lastOutput) return;
-    // Prefix diff mirrors SessionManager.inspect; when the pane shrank
-    // (clear/new program) re-send the whole screen instead of losing it.
-    const chunk = output.startsWith(t.lastOutput)
-      ? output.slice(t.lastOutput.length)
-      : output;
+    if (!(await this.app.sessions.tmuxTransport.isAlive(t.name))) {
+      // The shell exited (e.g. `exit`, or the host went down): drain whatever
+      // the dead pane still shows, then tear the terminal down. A terminal
+      // must NEVER keep looking live with no process behind it.
+      const chunk = outputDelta(t.lastOutput, output);
+      if (chunk.trim()) this.hub.append(sessionId, "shell", chunk, true);
+      this.hub.append(sessionId, "system", "shell process exited — terminal closed", true);
+      this.kill(sessionId);
+      return;
+    }
+    // Prefix/scroll/redraw-safe diff: appended lines, scrolled remainder and
+    // in-place redraws each produce ONLY the real change — no duplicated
+    // screen-fulls when tmux wraps or repaints.
+    const chunk = outputDelta(t.lastOutput, output);
     t.lastOutput = output;
     if (chunk.trim()) this.hub.append(sessionId, "shell", chunk, true);
   }

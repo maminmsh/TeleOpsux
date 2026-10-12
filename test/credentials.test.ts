@@ -41,12 +41,24 @@ class FakeRunner implements ExecRunner {
   readonly kind = "local" as const;
   sessions = new Set<string>();
   pane = new Map<string, string>();
+  /** The command tmux runs AS the pane process, keyed by session name. */
+  launches = new Map<string, string>();
   files = new Map<string, string>();
   visible: string[] = [];
   stdinWrites: string[] = [];
+  /** Binaries `command -v` cannot find (drives the launch preflight). */
+  missingBins = new Set<string>();
 
   async exec(cmd: string, args: string[]): Promise<ExecResult> {
     this.visible.push([cmd, ...args].join(" "));
+    if (cmd === "sh" && args[0] === "-lc") {
+      const bin = args[args.length - 1]!;
+      if (this.missingBins.has(bin))
+        return { code: 1, stdout: "", stderr: `${bin}: not found` };
+      // preflight simulates `command -v`: an already-absolute configured path
+      // is echoed unchanged, a bare name resolves into the fake PATH
+      return ok(`${bin.startsWith("/") ? bin : "/usr/local/bin/" + bin}\n`);
+    }
     if (cmd !== "tmux") return ok();
     const flag = (name: string): string => args[args.indexOf(name) + 1] ?? "";
     switch (args[0]) {
@@ -54,23 +66,37 @@ class FakeRunner implements ExecRunner {
         return ok("tmux 3.4");
       case "ls":
         return ok([...this.sessions].join("\n"));
-      case "new-session":
-        this.sessions.add(flag("-s"));
-        this.pane.set(flag("-s"), "");
+      case "new-session": {
+        const name = flag("-s");
+        this.sessions.add(name);
+        // remain-on-exit pane-command launch: the command IS the pane's
+        // process — record it separately; the pane only shows program output.
+        const ci = args.indexOf("-c");
+        const initial = args.length > ci + 2 ? args[ci + 2]! : "";
+        if (initial) this.launches.set(name, initial);
+        this.pane.set(name, "");
         return ok();
+      }
       case "send-keys": {
         const target = flag("-t");
         if (args.includes("-l"))
           this.pane.set(target, (this.pane.get(target) ?? "") + flag("-l") + "\n");
         return ok();
       }
-      case "display-message":
-        return ok("4242");
+      case "display-message": {
+        const target = flag("-t");
+        if (!this.sessions.has(target))
+          return { code: 1, stdout: "", stderr: "no session" };
+        return ok("0;;4242");
+      }
       case "capture-pane":
         return ok(this.pane.get(flag("-t")) ?? "");
-      case "kill-session":
-        this.sessions.delete(flag("-t"));
+      case "kill-session": {
+        const t = flag("-t");
+        this.sessions.delete(t);
+        this.pane.delete(t);
         return ok();
+      }
       default:
         return ok();
     }
@@ -90,7 +116,7 @@ class FakeRunner implements ExecRunner {
 
   /** The value a pane's shell would export, by replaying `$(cat FILE)` + `rm -f`. */
   injectedEnv(target: string): { file: string; value: string | undefined } {
-    const launch = (this.pane.get(target) ?? "").trim();
+    const launch = (this.launches.get(target) ?? "").trim();
     const m = launch.match(/="\$\(cat "([^"]+)"\)"; rm -f "\1";/);
     assert.ok(m, `launch command does not read+delete a staged file: ${launch}`);
     const file = m[1]!;
@@ -331,7 +357,7 @@ describe("per-user Qoder credentials: session isolation", () => {
         owner_telegram_user_id: USER_A,
       });
       await sessions.start(a.id);
-      const launch = runner.pane.get(target(config.sessions.tmux_prefix, a.id))!;
+      const launch = runner.launches.get(target(config.sessions.tmux_prefix, a.id))!;
       assert.ok(
         launch.includes("unset QODER_PERSONAL_ACCESS_TOKEN QODER_API_KEY"),
         "current and legacy inherited keys must be cleared",

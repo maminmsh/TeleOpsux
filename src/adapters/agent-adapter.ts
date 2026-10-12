@@ -21,6 +21,14 @@ export interface CreateSessionOptions {
    * content into the command line, and delete the file after reading.
    */
   secretFilePath?: string;
+  /**
+   * Absolute agent executable resolved by the launch preflight ON THE SESSION
+   * HOST (see SessionManager). Adapters must exec this instead of the bare
+   * configured name when present: a tmux pane inherits the tmux server's
+   * environment, whose PATH frequently differs from the interactive one that
+   * found the binary — an absolute path removes the reliance on PATH entirely.
+   */
+  resolvedCommand?: string;
 }
 
 export interface SessionSummary {
@@ -42,6 +50,15 @@ export interface SessionSummary {
 export interface AgentAdapter {
   readonly id: string;
   readonly name: string;
+
+  /**
+   * When the agent is launched via a standalone executable, the configured
+   * command name or path. SessionManager resolves + validates it ON THE
+   * SESSION HOST (login-shell PATH) before launch and passes the absolute
+   * result back through CreateSessionOptions.resolvedCommand. Shell-style
+   * adapters that need no external binary may omit it.
+   */
+  readonly executable?: string;
 
   /**
    * When set, every session of this agent needs the OWNER's own per-user

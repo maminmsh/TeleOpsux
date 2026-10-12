@@ -32,6 +32,10 @@ body { background:var(--bg); color:var(--ink); font:15px/1.45 -apple-system,"Seg
 #back { border:0; background:none; color:var(--accent); font-size:15px; padding:6px; cursor:pointer; }
 #title { font-weight:600; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 #badge { font-size:12px; padding:3px 9px; border-radius:999px; background:var(--line); white-space:nowrap; }
+#conn { font-size:11.5px; white-space:nowrap; color:var(--muted); display:none; }
+.conn-live { color:var(--ok); }
+.conn-idle { color:var(--muted); }
+.conn-retry { color:var(--warn); }
 main { flex:1; display:flex; flex-direction:column; min-height:0; }
 .view { display:none; flex-direction:column; min-height:0; flex:1; }
 .view.on { display:flex; }
@@ -81,6 +85,7 @@ button:disabled { opacity:.45; }
 <div id="topbar">
   <button id="back" title="Back to sessions">&#8592; Sessions</button>
   <div id="title">TeleOps Sessions</div>
+  <div id="conn"></div>
   <div id="badge" class="st-STOPPED">offline</div>
 </div>
 <div id="banner"></div>
@@ -133,7 +138,10 @@ else document.body.classList.add("theme-light");
 var H = { "X-Telegram-Init-Data": (tg && tg.initData) || "", "Content-Type": "application/json" };
 var $ = function (id) { return document.getElementById(id); };
 var state = { id: null, view: "live", mode: "chat", agentAfter: 0, termAfter: 0,
-  agentAbort: null, termAbort: null, termActive: false, pinned: true, backoff: 1000 };
+  agentAbort: null, termAbort: null, termActive: false, pinned: true, backoff: 1000,
+  // REAL link state: up = an open stream got an HTTP 200 body; lastByte/lastData
+  // are stamped by actual bytes on the wire — the indicator never simulates.
+  up: { agent: false, term: false }, lastByte: 0, lastData: 0 };
 var MAX_LINES = 800;
 
 function banner(msg) {
@@ -196,6 +204,20 @@ function addLine(source, at, text) {
   if (state.pinned) out.scrollTop = out.scrollHeight;
 }
 
+// ---------- connection / streaming indicator (driven by REAL wire activity) ----------
+function updateConnUI() {
+  var el = $("conn");
+  if (state.id == null || state.view !== "live") { el.style.display = "none"; el.textContent = ""; return; }
+  el.style.display = "";
+  var up = state.up.agent || state.up.term;
+  if (!up) { el.textContent = "↻ reconnecting…"; el.className = "conn-retry"; return; }
+  var now = Date.now();
+  if (now - state.lastData < 3000) { el.textContent = "● live"; el.className = "conn-live"; }
+  else if (now - state.lastByte < 20000) { el.textContent = "○ connected"; el.className = "conn-idle"; }
+  else { el.textContent = "↻ stale…"; el.className = "conn-retry"; }
+}
+setInterval(updateConnUI, 1000);
+
 // ---------- SSE over fetch (headers carry initData; EventSource cannot) ----------
 function parseSSE(buf, onMsg) {
   var blocks = buf.split("\\n\\n");
@@ -220,18 +242,24 @@ function openStream(which) {
   fetch(path + myId + "&after=" + after, { headers: H, signal: ctrl.signal })
     .then(function (res) {
       if (!res.ok || !res.body) throw new Error("stream http " + res.status);
+      state.up[which] = true;
+      state.lastByte = Date.now();
+      updateConnUI();
       var reader = res.body.getReader(), dec = new TextDecoder(), buf = "";
       function step() {
         return reader.read().then(function (r) {
           if (r.done) throw new Error("stream closed");
+          state.lastByte = Date.now();
           buf += dec.decode(r.value, { stream: true });
           buf = parseSSE(buf, function (ev, data) {
             if (state.id !== myId) return;
             if (ev === "line") {
+              state.lastData = Date.now();
               if (which === "agent") state.agentAfter = Math.max(state.agentAfter, data.seq);
               else state.termAfter = Math.max(state.termAfter, data.seq);
               addLine(data.source, data.at, data.text);
             } else if (ev === "status") {
+              state.lastData = Date.now();
               setBadge(data.status);
               $("meta").setAttribute("data-status", data.status);
               if (data.waiting_reason) addLine("system", new Date().toISOString(), "agent: " + data.waiting_reason);
@@ -246,12 +274,18 @@ function openStream(which) {
     .catch(function () {
       // dropped (network / server restart): free the slot so the revive
       // poller reconnects at the SAME seq cursor — no dup, no gap
-      if (state.id === myId && state[which + "Abort"] === ctrl) state[which + "Abort"] = null;
+      if (state.id === myId && state[which + "Abort"] === ctrl) {
+        state[which + "Abort"] = null;
+        state.up[which] = false;
+        updateConnUI();
+      }
     });
 }
 function closeStream(which) {
   var c = state[which + "Abort"];
+  state.up[which] = false;
   if (c) { state[which + "Abort"] = null; try { c.abort(); } catch (e) {} }
+  updateConnUI();
 }
 
 // The reader loop ends when the stream drops; poll cheaply to revive it.
@@ -265,6 +299,7 @@ setInterval(function () {
 // ---------- sessions list ----------
 function showList() {
   state.id = null; closeStream("agent"); closeStream("term");
+  updateConnUI();
   $("detailview").classList.remove("on"); $("listview").classList.add("on");
   $("title").textContent = "TeleOps Sessions"; $("badge").style.display = "none";
   loadList();
@@ -303,6 +338,8 @@ function showDetailChrome() {
 }
 function openSession(id) {
   state.id = id; state.view = "live"; state.agentAfter = 0; state.termAfter = 0;
+  state.up = { agent: false, term: false };
+  state.lastByte = Date.now(); state.lastData = Date.now();
   closeStream("agent"); closeStream("term");
   banner(null); out.textContent = ""; $("create").classList.remove("on");
   showDetailChrome(); syncViewUI();
@@ -335,6 +372,7 @@ function syncViewUI() {
   ["modes", "controls", "sendrow", "hint"].forEach(function (id) {
     $(id).style.display = hist ? "none" : "";
   });
+  updateConnUI();
 }
 $("vlive").onclick = function () {
   if (state.id == null || state.view === "live") return;

@@ -66,7 +66,8 @@ export function storedHistoryLines(
   return lines.slice(-count);
 }
 
-export class OutputHub {  private rings = new Map<number, Ring>();
+export class OutputHub {
+  private rings = new Map<number, Ring>();
   private busHandler: (e: DomainEvent) => void;
 
   constructor(

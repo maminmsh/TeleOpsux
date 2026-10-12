@@ -173,6 +173,16 @@ export function loadConfig(configFile?: string): Config {
 
   const merged = deepMerge(DEFAULTS, fileConfig);
 
+  // deepMerge only spreads ONE level, so merged.agents/.paths/.telegram still
+  // alias the module-level DEFAULTS. The env overrides below assign into those
+  // nested objects (merged.agents.qoder = {…}), which would permanently mutate
+  // DEFAULTS and leak one load() into the next for the whole process. Clone the
+  // merged tree so every call starts from pristine defaults.
+  merged.agents = { ...DEFAULTS.agents, ...(merged.agents ?? {}) };
+  merged.paths = { ...DEFAULTS.paths, ...merged.paths };
+  merged.telegram = { ...DEFAULTS.telegram, ...merged.telegram };
+  merged.webapp = { ...DEFAULTS.webapp, ...merged.webapp };
+
   merged.telegram.botToken =
     process.env.TELEGRAM_BOT_TOKEN ?? merged.telegram.botToken ?? "";
   merged.paths.database_file =
@@ -187,6 +197,15 @@ export function loadConfig(configFile?: string): Config {
     process.env.TELEOPS_WEBAPP_ENABLED !== undefined
       ? !["0", "false", "no"].includes(process.env.TELEOPS_WEBAPP_ENABLED.toLowerCase())
       : merged.webapp.enabled;
+
+  // Deploy-time executable override. Prefer an ABSOLUTE path here: a tmux pane
+  // inherits the tmux server's environment, which does not pick up additions
+  // an interactive login shell gets from ~/.profile / ~/.bashrc.
+  if (process.env.QODER_BIN)
+    merged.agents.qoder = {
+      ...(merged.agents.qoder ?? { enabled: true, command: "qoder" }),
+      command: process.env.QODER_BIN,
+    };
 
   return merged;
 }

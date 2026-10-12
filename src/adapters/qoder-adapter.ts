@@ -4,6 +4,11 @@ import { CreateSessionOptions } from "./agent-adapter";
 /** The only credential path this adapter will read: `$HOME/.teleops-credentials/teleops-session-<id>.key`. */
 const SECRET_FILE_PATH_RE = /^\$HOME\/\.teleops-credentials\/teleops-session-\d+\.key$/;
 
+/** Double-quote an executable path for shell use (handles spaces safely). */
+function dq(s: string): string {
+  return `"${s.replace(/[\\"$`]/g, (c) => `\\${c}`)}"`;
+}
+
 /**
  * Qoder CLI adapter (docs §72 Phase 2). Qoder is the reference agent but lives
  * entirely in this adapter — the core never mentions Qoder-specific behaviour.
@@ -24,9 +29,17 @@ export class QoderAdapter extends BaseAdapter {
     super();
   }
 
+  /** Preflight resolves + validates this before any session starts. */
+  get executable(): string {
+    return this.command;
+  }
+
   launchCommand(options: CreateSessionOptions): string {
+    // Prefer the host-resolved absolute path so a PATH that differs inside the
+    // tmux server can never produce "qoder: not found"; fall back to config.
+    const bin = options.resolvedCommand ?? this.command;
     const f = options.secretFilePath;
-    if (!f) return this.command;
+    if (!f) return dq(bin);
     // TeleOps-generated path only: $HOME + a fixed directory + a numeric id.
     // Anything else (quotes, backticks, semicolons, spaces) is refused.
     if (!SECRET_FILE_PATH_RE.test(f))
@@ -38,7 +51,7 @@ export class QoderAdapter extends BaseAdapter {
       // a session must never silently inherit a server-wide credential.
       `sh -c 'unset ${this.credentialEnvVar} QODER_API_KEY; ` +
       `${this.credentialEnvVar}="$(cat "${f}")"; rm -f "${f}"; ` +
-      `export ${this.credentialEnvVar}; exec ${this.command}'`
+      `export ${this.credentialEnvVar}; exec ${dq(bin)}'`
     );
   }
 
