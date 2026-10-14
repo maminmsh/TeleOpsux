@@ -28,7 +28,7 @@ import type { ProjectFiles } from "../src/session/project-files";
 import { SecretBox } from "../src/shared/secret-box";
 import { CredentialService } from "../src/credentials/credential-service";
 import { TelegramController } from "../src/telegram/bot";
-import { OutputHub } from "../src/web/output-hub";
+import { OutputHub, sessionKey, terminalKey } from "../src/web/output-hub";
 import { TerminalService } from "../src/web/terminal-service";
 import { redactSecrets } from "../src/auth/access";
 import { loadConfig } from "../src/config/config";
@@ -64,6 +64,8 @@ class FakeRunner implements ExecRunner {
   stdinWrites: string[] = [];
   missingBins = new Set<string>();
   deadPanes = new Map<string, number>();
+  /** $HOME of the fake session-host transport user. */
+  home = "/home/ops";
 
   private target(args: string[]): string {
     return args[args.indexOf("-t") + 1] ?? "";
@@ -73,6 +75,8 @@ class FakeRunner implements ExecRunner {
     this.argv.push(args);
     this.visible.push([cmd, ...args].join(" "));
     if (cmd === "sh" && args[0] === "-lc") {
+      // transport $HOME probe used by the personal terminal
+      if ((args[1] ?? "") === 'cd "$HOME" && pwd -P') return ok(`${this.home}\n`);
       // SessionManager preflight: sh -lc 'command -v "$1"' teleops-preflight <bin>
       const bin = args[args.length - 1]!;
       if (this.missingBins.has(bin))
@@ -189,10 +193,14 @@ function build(qoderCommand?: string) {
   const events: DomainEvent[] = [];
   bus.on("event", (e) => events.push(e));
 
+  // Owned by USER_A + globally active, so the per-user terminal's transport
+  // gate (effectiveActiveHostId === sessions.currentHostId) sees a consistent
+  // setup: USER_A (and every admin) legitimately lives on this host.
   const host = db.createHost({
     name: "h1", host: "h1.example", port: 22, username: "ops",
-    password_enc: "iv:tag:data", owner_telegram_user_id: null, visibility: "shared",
+    password_enc: "iv:tag:data", owner_telegram_user_id: USER_A, visibility: "shared",
   });
+  db.setActiveHost(host.id);
   sessions.attachHost({
     hostId: host.id,
     runner,
@@ -216,9 +224,10 @@ function build(qoderCommand?: string) {
 
   const hub = new OutputHub(bus, (t) => credentials.redactAll(redactSecrets(t)));
   const terminals = new TerminalService(app, hub);
+  // the personal terminal is per-USER — deleting an AI session must never
+  // kill it; only its own live ring is forgotten
   sessions.onDeleted((id) => {
-    terminals.drop(id);
-    hub.forget(id);
+    hub.forget(sessionKey(id));
   });
 
   const mk = (
@@ -387,8 +396,8 @@ describe("acceptance 4: agent chat input routing", () => {
       assert.ok(enter, "message never submitted with Enter");
       const rows = h.db.listMessages(s.id);
       assert.equal(rows.filter((r) => r.direction === "USER_TO_AGENT" && r.content === "refactor the parser").length, 1);
-      // no terminal shell existed for this session — nothing could shadow it
-      assert.equal(h.runner.names.has(`teleops-term-${s.id}`), false);
+      // no personal terminal had been opened — nothing could shadow the agent
+      assert.equal(h.runner.names.has(`teleops-term-u${USER_A}`), false);
     } finally {
       h.close();
     }
@@ -396,23 +405,38 @@ describe("acceptance 4: agent chat input routing", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Terminal mode: `pwd` output comes back from the real pane capture stream
+// 5. PERSONAL terminal: independent of AI sessions, `pwd` comes back from the
+//    real pane capture stream
 // ---------------------------------------------------------------------------
-describe("acceptance 5: terminal shell round-trip", () => {
-  it("a typed pwd shows up as shell output through the capture-diff pipeline", async () => {
+describe("acceptance 5: personal terminal shell round-trip", () => {
+  const termTarget = () => `teleops-term-u${USER_A}`;
+
+  it("a typed pwd shows up as shell output through the capture-diff pipeline — with ZERO AI sessions", async () => {
     const h = build();
     try {
-      const s = h.mk(USER_A, "shell", "/srv/app");
-      const st = await h.terminals.start(USER_A, s.id);
+      // no session exists at all: the terminal is per-user, not per-session
+      const st = await h.terminals.start(USER_A);
       assert.equal(st.active, true);
-      await h.terminals.sendText(USER_A, s.id, "pwd");
+      assert.equal(st.cwd, h.runner.home, "shell opens at the transport $HOME");
+      await h.terminals.sendText(USER_A, "pwd");
       await waitFor(
-        () => h.hub.snapshot(s.id, 200).some((l) => l.source === "shell" && l.text.includes("pwd")),
+        () =>
+          h.hub
+            .snapshot(terminalKey(USER_A), 200)
+            .some((l) => l.source === "shell" && l.text.includes("pwd")),
         6000,
         "pwd echoed from the pane",
       );
-      // the AGENT pane never saw the shell command
-      assert.deepEqual(h.runner.typedTo(h.targetOf(s.id)), []);
+      assert.deepEqual(h.runner.typedTo(termTarget()), ["pwd"]);
+      // and closing/reopening REUSES the same live pane (browser close ≠ kill)
+      h.terminals.shutdown();
+      const again = await h.terminals.start(USER_A);
+      assert.equal(again.active, true);
+      assert.equal(
+        h.runner.argv.filter((a) => a[0] === "new-session" && a.includes(termTarget())).length,
+        1,
+        "no second shell spawned for the same user",
+      );
     } finally {
       h.close();
     }
@@ -421,22 +445,40 @@ describe("acceptance 5: terminal shell round-trip", () => {
   it("an exited shell is refused input and cannot look live", async () => {
     const h = build();
     try {
-      const s = h.mk(USER_A);
-      await h.terminals.start(USER_A, s.id);
-      h.runner.deadPanes.set(`teleops-term-${s.id}`, 0); // user typed `exit`
-      await assert.rejects(
-        h.terminals.sendText(USER_A, s.id, "ls"),
-        /shell has exited/,
-      );
-      assert.equal(h.terminals.status(s.id).active, false, "dead shell never reports active");
-      // the death is surfaced in the stream (kill appends "terminal closed"; the
-      // poller's own notice says "shell process exited") — either way it is never
-      // left looking live with no process behind it.
+      await h.terminals.start(USER_A);
+      h.runner.deadPanes.set(termTarget(), 0); // user typed `exit`
+      await assert.rejects(h.terminals.sendText(USER_A, "ls"), /shell has exited/);
+      assert.equal(h.terminals.status(USER_A).active, false, "dead shell never reports active");
+      // the death is surfaced in the stream (the kill path appends
+      // "terminal closed"; the poller's own notice says "shell process
+      // exited") — never left looking live with no process behind it.
       await waitFor(
-        () => h.hub.snapshot(s.id, 200).some((l) => l.source === "system" && /shell process exited|terminal closed/.test(l.text)),
+        () =>
+          h.hub
+            .snapshot(terminalKey(USER_A), 200)
+            .some(
+              (l) =>
+                l.source === "system" &&
+                /shell process exited|terminal closed/.test(l.text),
+            ),
         6000,
         "death notice in stream",
       );
+    } finally {
+      h.close();
+    }
+  });
+
+  it("two users get two isolated shells: B never sees A's shell ring", async () => {
+    const h = build();
+    try {
+      await h.terminals.start(USER_A);
+      h.hub.append(terminalKey(USER_A), "shell", "A-SECRET-LINE");
+      const bLines = h.hub.snapshot(terminalKey(USER_B), 100).map((l) => l.text);
+      assert.ok(!bLines.some((t) => t.includes("A-SECRET-LINE")));
+      // USER_B is not on the active host (owned by USER_A, B is not admin):
+      // the transport gate refuses with an actionable error, not a silent mix
+      await assert.rejects(h.terminals.start(USER_B), /active server differs/);
     } finally {
       h.close();
     }
@@ -484,7 +526,7 @@ describe("acceptance 6/8: incremental output, dedupe at the source", () => {
       assert.equal(chunk, "building module C");
       assert.ok(!chunk.includes("building module B"), "scrolled-off line re-emitted");
       // the live ring saw the same single emission (same source, no second copy)
-      const texts = h.hub.snapshot(s.id, 200).filter((l) => l.source === "agent").map((l) => l.text);
+      const texts = h.hub.snapshot(sessionKey(s.id), 200).filter((l) => l.source === "agent").map((l) => l.text);
       assert.equal(texts.filter((t) => t === "building module C").length, 1);
       assert.equal(texts.filter((t) => t === "building module B").length, 1);
     } finally {
@@ -538,10 +580,10 @@ describe("acceptance 9: reconnect/restart does not duplicate the process", () =>
       assert.equal(h.db.getSession(s.id)!.pid, 4321, "pid re-recorded from the live pane");
 
       // stream resume math: a client cursor replays exactly the newer lines
-      h.hub.append(s.id, "agent", "l1");
-      const cursor = h.hub.lastSeq(s.id);
-      h.hub.append(s.id, "agent", "l2");
-      const replay = h.hub.since(s.id, cursor).map((l) => l.text);
+      h.hub.append(sessionKey(s.id), "agent", "l1");
+      const cursor = h.hub.lastSeq(sessionKey(s.id));
+      h.hub.append(sessionKey(s.id), "agent", "l2");
+      const replay = h.hub.since(sessionKey(s.id), cursor).map((l) => l.text);
       assert.ok(!replay.includes("l1"));
       assert.ok(replay.includes("l2"));
     } finally {
@@ -698,7 +740,7 @@ describe("acceptance 12: credentials never surface", () => {
         h.runner.visible.join("\n"), // every command line the host would see
         JSON.stringify(h.db.getSession(s.id)), // waiting_reason, last_output…
         JSON.stringify(h.events), // every emitted domain event payload
-        h.hub.snapshot(s.id, 500).map((l) => l.text).join("\n"), // stream lines
+        h.hub.snapshot(sessionKey(s.id), 500).map((l) => l.text).join("\n"), // stream lines
       ];
       for (const surface of surfaces)
         assert.ok(!surface.includes(KEY_A), "secret surfaced in: " + surface.slice(0, 120));
@@ -721,7 +763,7 @@ describe("acceptance 12: credentials never surface", () => {
         session_id: s.id,
         payload: { chunk: `password=hunter2 then ${KEY_A} inline` },
       });
-      const line = h.hub.snapshot(s.id, 10).find((l) => l.text.includes("inline"));
+      const line = h.hub.snapshot(sessionKey(s.id), 10).find((l) => l.text.includes("inline"));
       assert.ok(line, "output line missing");
       assert.ok(!line.text.includes(KEY_A), "stored key leaked into a stream line");
       assert.ok(!line.text.includes("hunter2"), "inline secret leaked into a stream line");
@@ -746,7 +788,10 @@ describe("acceptance 13: stop and failure consistency", () => {
       assert.equal(h.db.getSession(s.id)!.status, "STOPPED");
       assert.equal(h.runner.names.has(h.targetOf(s.id)), false, "pane really killed");
       await assert.rejects(h.sessions.sendInput(s.id, "still there?"), /STOPPED/);
-      await assert.rejects(h.terminals.sendText(USER_A, s.id, "ls"), /Terminal is not open/);
+      // the PERSONAL terminal is a different thing entirely: it was never
+      // opened, and stopping a session neither opens nor kills it
+      await assert.rejects(h.terminals.sendText(USER_A, "ls"), /Terminal is not open/);
+      assert.equal(h.runner.names.has(`teleops-term-u${USER_A}`), false);
     } finally {
       h.close();
     }
@@ -773,7 +818,7 @@ describe("acceptance 13: stop and failure consistency", () => {
       assert.match(reason.reason, /exited \(code 137\)/);
       // the stream says so, once — and stays consistent afterwards
       const notices = () =>
-        h.hub.snapshot(s.id, 500).filter((l) => l.source === "system" && l.text.includes("agent process crashed")).length;
+        h.hub.snapshot(sessionKey(s.id), 500).filter((l) => l.source === "system" && l.text.includes("agent process crashed")).length;
       await sleep(2300); // two more poll cycles
       assert.equal(crashes(), 1, "crash never re-reported");
       assert.equal(notices(), 1);

@@ -23,7 +23,7 @@ import { SessionManager } from "../src/session/session-manager";
 import { SecretBox } from "../src/shared/secret-box";
 import { CredentialService } from "../src/credentials/credential-service";
 import { TelegramController } from "../src/telegram/bot";
-import { OutputHub } from "../src/web/output-hub";
+import { OutputHub, sessionKey, terminalKey } from "../src/web/output-hub";
 import { TerminalService } from "../src/web/terminal-service";
 import { MiniAppServer } from "../src/web/mini-app-server";
 import { validateInitData } from "../src/web/telegram-init-data";
@@ -62,39 +62,82 @@ function signInitData(
 }
 
 // ---------- fake tmux transport ----------
+const FAKE_HOME = "/home/tester";
+
 class FakeRunner implements ExecRunner {
   kind = "local" as const;
   argv: string[][] = [];
+  /** Every execScript body + stdin seen (credential staging, mkdir/ln, rm). */
+  scripts: string[] = [];
+  stdinWrites: string[] = [];
   names = new Set<string>();
   panes = new Map<string, string>();
   /** Binaries `command -v` (launch preflight) cannot find. */
   missingBins = new Set<string>();
   /** Panes whose process exited: tmux name -> exit code (remain-on-exit). */
   deadPanes = new Map<string, number>();
+  /** Set to make `tmux -V` fail → tmux "not available on this server". */
+  noTmux = false;
+  /** Fake session-host filesystem for the directory browser. */
+  dirs = new Set<string>([FAKE_HOME, `${FAKE_HOME}/projects`, `${FAKE_HOME}/projects/repo`, "/home", "/etc"]);
+  symlinks = new Map<string, string>([[`${FAKE_HOME}/escape`, "/etc"]]);
+  dirEntries = new Map<string, string>([
+    [FAKE_HOME, "projects/\nnotes.txt\n"],
+    [`${FAKE_HOME}/projects`, "repo/\nsrc/\nreadme.md\n"],
+  ]);
 
   private target(args: string[]): string {
     return args[args.indexOf("-t") + 1] ?? "";
+  }
+  /** Lexical `..` resolution + fake symlink hop, like a real `cd && pwd -P`. */
+  private resolveDir(candidate: string): string {
+    const segs: string[] = [];
+    for (const seg of candidate.split("/")) {
+      if (seg === "" || seg === ".") continue;
+      if (seg === "..") segs.pop();
+      else segs.push(seg);
+    }
+    const norm = "/" + segs.join("/");
+    return this.symlinks.get(norm) ?? norm;
   }
   async exec(cmd: string, args: string[]): Promise<ExecResult> {
     this.argv.push(args);
     const ok = (stdout = ""): ExecResult => ({ code: 0, stdout, stderr: "" });
     const gone = (): ExecResult => ({ code: 1, stdout: "", stderr: "no session" });
     if (cmd === "sh" && args[0] === "-lc") {
-      // SessionManager preflight: sh -lc 'command -v "$1"' <argv0> <bin>
+      const script = args[1] ?? "";
+      // transport $HOME probe (terminal + browser root)
+      if (script === 'cd "$HOME" && pwd -P') return ok(`${FAKE_HOME}\n`);
+      // directory-browser canonicalization: sh -lc 'cd "$1" …' teleops-browse <cand>
+      if (script === 'cd "$1" 2>/dev/null && pwd -P') {
+        const real = this.resolveDir(args[3] ?? "");
+        return this.dirs.has(real) ? ok(`${real}\n`) : { code: 1, stdout: "", stderr: "no dir" };
+      }
+      // SessionManager/terminal preflight: command -v "$1" <argv0> <bin>
       const bin = args[args.length - 1]!;
       return this.missingBins.has(bin)
         ? { code: 1, stdout: "", stderr: `${bin}: not found` }
         : ok(`${bin.startsWith("/") ? bin : "/usr/local/bin/" + bin}\n`);
     }
+    if (cmd === "ls") {
+      // browser listing: ls -1F -- <dir>
+      const dir = args[args.length - 1] ?? "";
+      const listing = this.dirEntries.get(dir);
+      return listing === undefined
+        ? { code: 2, stdout: "", stderr: `cannot access ${dir}` }
+        : ok(listing);
+    }
     switch (args[0]) {
       case "-V":
-        return ok("tmux 3.4\n");
+        return this.noTmux
+          ? { code: 127, stdout: "", stderr: "tmux: not found" }
+          : ok("tmux 3.4\n");
       case "ls":
         return ok([...this.names].join("\n") + (this.names.size ? "\n" : ""));
       case "new-session": {
-        const s = args[args.indexOf("-s") + 1];
+        const s = args[args.indexOf("-s") + 1]!;
         this.names.add(s);
-        // with a pane COMMAND the agent is the pane process (no shell prompt);
+        // with a pane COMMAND the process is the agent (no shell prompt);
         // without one it is the interactive terminal shell.
         const ci = args.indexOf("-c");
         const isAgent = args.length > ci + 2;
@@ -134,14 +177,20 @@ class FakeRunner implements ExecRunner {
         return ok();
     }
   }
-  async execScript(): Promise<ExecResult> {
+  async execScript(script: string, opts?: { input?: string }): Promise<ExecResult> {
+    this.scripts.push(script);
+    if (opts?.input !== undefined) this.stdinWrites.push(opts.input);
     return { code: 0, stdout: "", stderr: "" };
+  }
+  /** Everything the host would ever see in a command LINE (never stdin). */
+  visible(): string {
+    return [...this.argv.map((a) => a.join(" ")), ...this.scripts].join("\n");
   }
   /** argv rows of tmux send-keys that typed literal TEXT to a target. */
   typedTo(target: string): string[] {
     return this.argv
       .filter((a) => a[0] === "send-keys" && a.includes("-l") && a[a.indexOf("-t") + 1] === target)
-      .map((a) => a[a.length - 1]);
+      .map((a) => a[a.length - 1]!);
   }
 }
 
@@ -189,10 +238,10 @@ async function buildHarness(webappUrl = "https://mini.example.com/teleops") {
     (t) => credentials.redactAll(redactSecrets(t)),
   );
   const terminals = new TerminalService(app, hub);
-  // same wiring as main.ts: the shared deletion path cleans the web layer
+  // same wiring as main.ts: deleting a session forgets its live ring — the
+  // PERSONAL terminal is per-user and deliberately survives session deletion
   sessions.onDeleted((id) => {
-    terminals.drop(id);
-    hub.forget(id);
+    hub.forget(sessionKey(id));
   });
   const server = new MiniAppServer(app, hub, terminals);
   const { port } = await server.listen();
@@ -213,7 +262,7 @@ async function buildHarness(webappUrl = "https://mini.example.com/teleops") {
     db.close();
     logs.close();
   }
-  return { app, db, bus, hub, runner, port, sessions, credentials, mk, close, config };
+  return { app, db, bus, hub, runner, port, sessions, terminals, credentials, mk, close, config };
 }
 
 type H = Awaited<ReturnType<typeof buildHarness>>;
@@ -370,8 +419,6 @@ describe("id-guessing is not authorization", () => {
         ["POST", `/api/session/input?id=${a.id}`, { text: "hi" }],
         ["POST", `/api/session/stop?id=${a.id}`],
         ["POST", `/api/session/delete?id=${a.id}`],
-        ["POST", `/api/terminal/start?id=${a.id}`],
-        ["POST", `/api/terminal/input?id=${a.id}`, { text: "id" }],
         ["GET", `/api/session?id=${b.id + 99999}`], // unknown id
       ];
       for (const [method, p, body] of probes) {
@@ -382,6 +429,10 @@ describe("id-guessing is not authorization", () => {
       // nothing touched A's resources; the delete probe deleted nothing
       assert.equal(h.runner.argv.length, 0);
       assert.ok(h.db.getSession(a.id));
+      // personal terminal endpoints take NO session id at all — an attacker
+      // can only ever reach their OWN terminal, so there is nothing to guess
+      const own = await req(h, "/api/terminal/start", USER_B, "POST");
+      assert.equal(own.status, 200);
     } finally {
       await h.close();
     }
@@ -394,7 +445,7 @@ describe("output stream", () => {
     const h = await buildHarness();
     try {
       const s = h.mk(USER_A);
-      for (let i = 1; i <= 60; i++) h.hub.append(s.id, "agent", `line ${i}`);
+      for (let i = 1; i <= 60; i++) h.hub.append(sessionKey(s.id), "agent", `line ${i}`);
       const r = await req(h, `/api/session?id=${s.id}`, USER_A);
       const lines = r.json.lines;
       assert.equal(lines.length, 50);
@@ -504,9 +555,9 @@ describe("output stream", () => {
   });
 });
 
-// ---------- 8. agent chat vs terminal never cross ----------
+// ---------- 8. agent chat vs personal terminal never cross ----------
 describe("two input modes", () => {
-  it("Agent Chat input goes to the agent pane only; terminal input to the shell pane only", async () => {
+  it("Agent Chat input goes to the agent pane only; terminal input to the user's own shell pane", async () => {
     const h = await buildHarness();
     try {
       const s = h.mk(USER_A, "/srv/app");
@@ -520,86 +571,288 @@ describe("two input modes", () => {
       assert.equal(chat.status, 200);
       // real SessionManager → tmux send-keys on teleops-<id>
       assert.deepEqual(h.runner.typedTo(`teleops-${s.id}`), ["hello agent"]);
-      // terminal mode
-      const start = await req(h, `/api/terminal/start?id=${s.id}`, USER_A, "POST");
+      // personal terminal mode — NO session id; a zero-session user gets in too
+      const start = await req(h, "/api/terminal/start", USER_A, "POST");
       assert.equal(start.status, 200);
       assert.equal(start.json.active, true);
-      // dedicated shell at the session cwd, on the session's transport
+      assert.equal(start.json.cwd, FAKE_HOME);
+      // dedicated per-user shell at the transport $HOME
       const newTerm = h.runner.argv.find(
-        (a) => a[0] === "new-session" && a.includes("teleops-term-" + s.id),
+        (a) => a[0] === "new-session" && a.includes("teleops-term-u" + USER_A),
       );
-      assert.ok(newTerm, "term-<id> session not created");
-      assert.equal(newTerm![newTerm!.indexOf("-c") + 1], "/srv/app");
-      const tin = await req(h, `/api/terminal/input?id=${s.id}`, USER_A, "POST", {
-        text: "ls -la",
-      });
+      assert.ok(newTerm, "term-u<uid> session not created");
+      assert.equal(newTerm![newTerm!.indexOf("-c") + 1], FAKE_HOME);
+      const tin = await req(h, "/api/terminal/input", USER_A, "POST", { text: "ls -la" });
       assert.equal(tin.status, 200);
-      assert.deepEqual(h.runner.typedTo(`teleops-term-${s.id}`), ["ls -la"]);
+      assert.deepEqual(h.runner.typedTo(`teleops-term-u${USER_A}`), ["ls -la"]);
       // agent pane never received the shell command, shell never got the chat
       assert.deepEqual(h.runner.typedTo(`teleops-${s.id}`), ["hello agent"]);
-      assert.ok(!h.runner.typedTo(`teleops-term-${s.id}`).includes("hello agent"));
+      assert.ok(!h.runner.typedTo(`teleops-term-u${USER_A}`).includes("hello agent"));
     } finally {
       await h.close();
     }
   });
 
-  it("terminal keeps state across commands (persistent pane, not one-shot exec)", async () => {
+  it("terminal keeps state across commands; a repeat open reuses the ONE persistent pane", async () => {
     const h = await buildHarness();
     try {
-      const s = h.mk(USER_A);
-      await req(h, `/api/terminal/start?id=${s.id}`, USER_A, "POST");
-      await req(h, `/api/terminal/input?id=${s.id}`, USER_A, "POST", { text: "cd subdir" });
-      await req(h, `/api/terminal/input?id=${s.id}`, USER_A, "POST", { text: "pwd" });
+      await req(h, "/api/terminal/start", USER_A, "POST");
+      await req(h, "/api/terminal/start", USER_A, "POST"); // browser reopened → reuse
+      await req(h, "/api/terminal/input", USER_A, "POST", { text: "cd subdir" });
+      await req(h, "/api/terminal/input", USER_A, "POST", { text: "pwd" });
       // both lines were typed into the SAME tmux pane, which keeps its own cwd
-      assert.deepEqual(h.runner.typedTo(`teleops-term-${s.id}`), ["cd subdir", "pwd"]);
-      // exactly one shell session for this chat session
+      assert.deepEqual(h.runner.typedTo(`teleops-term-u${USER_A}`), ["cd subdir", "pwd"]);
       const termNames = h.runner.argv.filter(
         (a) => a[0] === "new-session" && a.some((x) => String(x).includes("term-")),
       );
-      assert.equal(termNames.length, 1);
+      assert.equal(termNames.length, 1, "exactly one shell session per user");
     } finally {
       await h.close();
     }
   });
 
-  it("Ctrl+C is sent as a real key; keys outside the allowlist are refused", async () => {
+  it("Ctrl+C is sent as a real key; keys outside the allowlist are refused with an error", async () => {
     const h = await buildHarness();
     try {
-      const s = h.mk(USER_A);
-      await req(h, `/api/terminal/start?id=${s.id}`, USER_A, "POST");
-      const c = await req(h, `/api/terminal/key?id=${s.id}`, USER_A, "POST", { key: "C-c" });
+      await req(h, "/api/terminal/start", USER_A, "POST");
+      const c = await req(h, "/api/terminal/key", USER_A, "POST", { key: "C-c" });
       assert.equal(c.status, 200);
       assert.ok(
         h.runner.argv.some(
           (a) =>
             a[0] === "send-keys" &&
-            a[a.indexOf("-t") + 1] === `teleops-term-${s.id}` &&
+            a[a.indexOf("-t") + 1] === `teleops-term-u${USER_A}` &&
             a[a.length - 1] === "C-c",
         ),
       );
-      const bad = await req(h, `/api/terminal/key?id=${s.id}`, USER_A, "POST", {
+      const bad = await req(h, "/api/terminal/key", USER_A, "POST", {
         key: "C-x; rm -rf /",
       });
       assert.equal(bad.status, 400);
+      assert.match(bad.json.error, /not allowed/);
     } finally {
       await h.close();
     }
   });
 
-  it("terminal streams shell output to the terminal SSE channel (source=shell)", async () => {
+  it("terminal streams shell output to the user's own SSE channel (source=shell)", async () => {
+    const h = await buildHarness();
+    try {
+      // ZERO AI sessions — opening the Mini App goes straight to the terminal
+      await req(h, "/api/terminal/start", USER_A, "POST");
+      const sse = await openSSE(h, "/api/terminal/events?after=0", USER_A);
+      assert.equal(sse.status, 200);
+      await req(h, "/api/terminal/input", USER_A, "POST", { text: "git status" });
+      let got = "";
+      for (let i = 0; i < 8 && !got.includes("git status"); i++) {
+        const e = await sse.next();
+        assert.equal(e.event, "line");
+        assert.equal(e.data.source, "shell"); // never agent/system noise here
+        got += e.data.text;
+      }
+      assert.match(got, /git status/);
+      sse.cancel();
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+// ---------- 8b. `qoder` in the personal terminal: same credential path ----------
+describe("terminal qoder credential path", () => {
+  it("a stored PAT is exported INSIDE the pane command, staged 0600 via stdin, never in a command line", async () => {
+    const h = await buildHarness();
+    try {
+      const secret = "QODERKEY-PAT-7788";
+      h.credentials.save(USER_A, secret);
+      const start = await req(h, "/api/terminal/start", USER_A, "POST");
+      assert.equal(start.status, 200);
+      const ns = h.runner.argv.find(
+        (a) => a[0] === "new-session" && a.includes(`teleops-term-u${USER_A}`),
+      );
+      assert.ok(ns, "terminal pane never created");
+      const paneCommand = String(ns![ns!.length - 1]!);
+      // token read from the staged file inside the command (never argv) and
+      // deleted at exec; preflighted qoder pinned on PATH — like a managed session
+      assert.match(paneCommand, /QODER_PERSONAL_ACCESS_TOKEN="\$\(cat /);
+      assert.match(paneCommand, /teleops-term-111\.key/);
+      assert.match(paneCommand, /rm -f/);
+      assert.match(paneCommand, /\$HOME\/\.teleops\/bin/);
+      const staging = h.runner.scripts.find(
+        (s) => s.includes("teleops-term-111.key") && s.includes("cat >"),
+      );
+      assert.ok(staging, "credential file never staged");
+      assert.match(staging, /umask 077/);
+      assert.match(staging, /chmod 600/);
+      assert.equal(h.runner.stdinWrites.filter((k) => k === secret).length, 1);
+      assert.ok(!h.runner.visible().includes(secret), "PAT leaked into a command line");
+      assert.ok(
+        h.runner.argv.some(
+          (a) => a[0] === "-lc" && a[1] === 'command -v "$1"' && a[a.length - 1] === "qoder",
+        ),
+        "qoder binary was never preflighted",
+      );
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("without a stored key the terminal still opens and TELLS the user how to enable qoder", async () => {
+    const h = await buildHarness();
+    try {
+      const start = await req(h, "/api/terminal/start", USER_B, "POST");
+      assert.equal(start.status, 200);
+      const lines = h.hub.snapshot(terminalKey(USER_B), 50).map((l) => l.text);
+      assert.ok(lines.some((t) => /\/qoderkey/.test(t)), "hint missing from system lines");
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("rings are isolated per user: A's shell output never reaches B's terminal stream", async () => {
+    const h = await buildHarness();
+    try {
+      await req(h, "/api/terminal/start", USER_A, "POST");
+      await req(h, "/api/terminal/start", USER_B, "POST");
+      h.hub.append(terminalKey(USER_A), "shell", "SECRET-A-SHELL");
+      h.hub.append(terminalKey(USER_B), "shell", "b-line");
+      const b = h.hub.snapshot(terminalKey(USER_B), 100).map((l) => l.text);
+      assert.ok(b.some((t) => t === "b-line"));
+      assert.ok(!b.some((t) => t.includes("SECRET-A-SHELL")), "cross-user ring leak");
+      const sse = await openSSE(h, `/api/terminal/events?after=0`, USER_B);
+      const first = await sse.next();
+      assert.match(first.data.text, /b-line/);
+      h.hub.append(terminalKey(USER_A), "shell", "LIVE-A-SECRET");
+      await assert.rejects(sse.next(1500), /SSE timeout/, "A's line leaked to B live");
+      sse.cancel();
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+// ---------- 8c. closing the app must NOT kill the shell ----------
+describe("terminal survival", () => {
+  it("session deletion and TeleOps shutdown leave the pane running; only Stop kills it", async () => {
     const h = await buildHarness();
     try {
       const s = h.mk(USER_A);
-      await req(h, `/api/terminal/start?id=${s.id}`, USER_A, "POST");
-      const sse = await openSSE(h, `/api/terminal/events?id=${s.id}&after=0`, USER_A);
-      const first = await sse.next(); // initial prompt captured by the poller
-      assert.equal(first.event, "line");
-      assert.equal(first.data.source, "shell");
-      await req(h, `/api/terminal/input?id=${s.id}`, USER_A, "POST", { text: "git status" });
-      let got = "";
-      for (let i = 0; i < 3 && !got.includes("git status"); i++) got += (await sse.next()).data.text;
-      assert.match(got, /git status/);
-      sse.cancel();
+      await req(h, "/api/terminal/start", USER_A, "POST");
+      const killed = () =>
+        h.runner.argv.some(
+          (a) => a[0] === "kill-session" && a[a.indexOf("-t") + 1] === `teleops-term-u${USER_A}`,
+        );
+      // deleting an AI session never takes the personal terminal with it
+      const del = await req(h, `/api/session/delete?id=${s.id}`, USER_A, "POST");
+      assert.equal(del.status, 200);
+      // idle GC / TeleOps restart: timers cleared, shell untouched
+      h.terminals.shutdown();
+      assert.ok(!killed(), "personal pane must never be auto-killed");
+      assert.ok(h.runner.names.has(`teleops-term-u${USER_A}`), "tmux shell still running");
+      // reopening attaches to the SAME live pane (scrollback preserved)
+      await req(h, "/api/terminal/start", USER_A, "POST");
+      const termSessions = h.runner.argv.filter(
+        (a) => a[0] === "new-session" && a.includes(`teleops-term-u${USER_A}`),
+      );
+      assert.equal(termSessions.length, 1, "reopen must not spawn a second shell");
+      // explicit Stop is the ONLY kill path
+      const stop = await req(h, "/api/terminal/stop", USER_A, "POST");
+      assert.equal(stop.status, 200);
+      assert.ok(killed());
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+// ---------- 8d. directory browser + create-in-chosen-directory ----------
+describe("directory browser and create in chosen dir", () => {
+  it("lists the user's own dirs under $HOME with parent navigation", async () => {
+    const h = await buildHarness();
+    try {
+      const root = await req(h, "/api/browse", USER_A);
+      assert.equal(root.status, 200);
+      assert.equal(root.json.path, FAKE_HOME);
+      assert.equal(root.json.home, FAKE_HOME);
+      assert.equal(root.json.parent, null);
+      assert.deepEqual(root.json.dirs, ["projects"]);
+      const sub = await req(h, "/api/browse?path=projects", USER_A);
+      assert.equal(sub.status, 200);
+      assert.equal(sub.json.path, `${FAKE_HOME}/projects`);
+      assert.deepEqual(sub.json.dirs, ["repo", "src"]); // files are not listed
+      assert.equal(sub.json.parent, FAKE_HOME);
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("everything outside $HOME is refused WITH an explainable error: /etc, .. escape, symlink hop", async () => {
+    const h = await buildHarness();
+    try {
+      const seen: string[] = [];
+      for (const probe of ["/etc", "projects/../../..", "escape", "nope"]) {
+        const r = await req(h, `/api/browse?path=${encodeURIComponent(probe)}`, USER_A);
+        assert.equal(r.status, 400, `${probe} must be refused`);
+        assert.match(
+          r.json.error,
+          /restricted to your own home|Not a readable directory/,
+          `${probe} → readable refusal`,
+        );
+        seen.push(r.json.error);
+      }
+      assert.equal(new Set(seen).size >= 2, true, "confinement AND existence errors surface");
+      // a refused probe never reached the listing command
+      assert.ok(!h.runner.argv.some((a) => a[0] === "-1" && a.includes("/etc")));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("a normal user may create a session in a browsed dir (canonicalized cwd); both-at-once is an error", async () => {
+    const h = await buildHarness();
+    try {
+      const r = await req(h, "/api/session/create", USER_B, "POST", {
+        agent: "shell",
+        task: "run it",
+        cwd: "projects",
+      });
+      assert.equal(r.status, 200);
+      const created = h.db.getSession(r.json.id)!;
+      assert.equal(created.cwd, `${FAKE_HOME}/projects`);
+      assert.equal(created.owner_telegram_user_id, USER_B);
+      const both = await req(h, "/api/session/create", USER_B, "POST", {
+        agent: "shell",
+        project_id: 1,
+        cwd: "projects",
+      });
+      assert.equal(both.status, 400);
+      assert.match(both.json.error, /EITHER/);
+      const out = await req(h, "/api/session/create", USER_B, "POST", {
+        agent: "shell",
+        cwd: "/etc",
+      });
+      assert.equal(out.status, 400);
+      assert.match(out.json.error, /Not a readable directory/);
+    } finally {
+      await h.close();
+    }
+  });
+});
+
+// ---------- 8e. every failure reaches the user ----------
+describe("error surface", () => {
+  it("missing tmux → 400 with the real reason; wrong method → 405; input before start → clear error", async () => {
+    const h = await buildHarness();
+    try {
+      const early = await req(h, "/api/terminal/input", USER_A, "POST", { text: "ls" });
+      assert.equal(early.status, 400);
+      assert.match(early.json.error, /not open/);
+      const wrongMethod = await req(h, "/api/terminal/start", USER_A, "GET");
+      assert.equal(wrongMethod.status, 405);
+      h.runner.noTmux = true;
+      const r = await req(h, "/api/terminal/start", USER_A, "POST");
+      assert.equal(r.status, 400);
+      assert.match(r.json.error, /tmux/);
     } finally {
       await h.close();
     }
@@ -672,7 +925,7 @@ describe("lifecycle + creation", () => {
 
 // ---------- 9b. delete + stored history ----------
 describe("session delete and stored history", () => {
-  it("owner delete kills agent + shell panes and removes every stored row", async () => {
+  it("owner delete kills the agent pane, removes every stored row, and leaves the personal terminal RUNNING", async () => {
     const h = await buildHarness();
     try {
       const s = h.mk(USER_A);
@@ -681,17 +934,21 @@ describe("session delete and stored history", () => {
       h.db.createTaskLog({
         session_id: s.id, project_id: null, remote_path: "/x.log", task: null, status: "STARTED",
       });
-      await req(h, `/api/terminal/start?id=${s.id}`, USER_A, "POST");
+      await req(h, "/api/terminal/start", USER_A, "POST");
       const r = await req(h, `/api/session/delete?id=${s.id}`, USER_A, "POST");
       assert.equal(r.status, 200);
       assert.equal(h.db.getSession(s.id), undefined);
       assert.equal(h.db.listTaskLogs({ session_id: s.id }).length, 0, "task_logs FK rows gone");
       assert.equal(h.db.listEvents(s.id, 10).length, 0, "event rows incl. the stop event gone");
-      // real teardown ran: agent pane AND the dedicated shell pane were killed
+      // real teardown ran on the AGENT pane…
       assert.ok(h.runner.argv.some(
         (a) => a[0] === "kill-session" && a[a.indexOf("-t") + 1] === `teleops-${s.id}`));
-      assert.ok(h.runner.argv.some(
-        (a) => a[0] === "kill-session" && a[a.indexOf("-t") + 1] === `teleops-term-${s.id}`));
+      // …but the personal terminal is session-INDEPENDENT — it survives
+      assert.ok(h.runner.names.has(`teleops-term-u${USER_A}`), "shell pane must stay alive");
+      assert.ok(!h.runner.argv.some(
+        (a) => a[0] === "kill-session" && a[a.indexOf("-t") + 1] === `teleops-term-u${USER_A}`),
+        "deleting a session must never kill the personal terminal");
+      assert.equal(h.terminals.status(USER_A).active, true);
       const list = await req(h, "/api/sessions", USER_A);
       assert.deepEqual(list.json.sessions.map((x: any) => x.id), []);
       const det = await req(h, `/api/session?id=${s.id}`, USER_A);
@@ -739,13 +996,16 @@ describe("session delete and stored history", () => {
     }
   });
 
-  it("page shows the three per-session actions: live, last 50 lines, delete", async () => {
+  it("page shows the per-session actions AND the persistent terminal + browse UI", async () => {
     const h = await buildHarness();
     try {
       const page = await fetch(url(h, "/"), { signal: AbortSignal.timeout(5000) });
       const html = await page.text();
       for (const probe of ["vlive", "vhist", "vdel", "Last 50 lines", "Delete",
-        "/api/session/history", "/api/session/delete"])
+        "/api/session/history", "/api/session/delete",
+        // personal Linux Terminal + directory browser (requirements 1/5/6)
+        "termview", "Linux Terminal", "/api/terminal/start", "/api/browse",
+        "ccwd", "cbrowse"])
         assert.ok(html.includes(probe), `page missing ${probe}`);
     } finally {
       await h.close();
@@ -903,6 +1163,25 @@ describe("telegram session trio (history / confirm / delete)", () => {
       assert.ok(flat.some((b: any) => b.web_app), "live Mini App button missing");
       assert.ok(flat.some((b: any) => b.callback_data === `hist50:${s.id}`));
       assert.ok(flat.some((b: any) => b.callback_data === `delreq:${s.id}`));
+    } finally {
+      await h.close();
+    }
+  });
+
+  it("sessions screen with ZERO sessions still offers the 🖥 Linux Terminal button (requirement 6)", async () => {
+    const h = await buildHarness();
+    try {
+      const controller = new TelegramController(h.app);
+      const spec = (controller as any).sessionsSpec(USER_A);
+      assert.match(spec.text, /No sessions yet/);
+      assert.match(spec.text, /Linux Terminal/);
+      const btn = spec.kb.inline_keyboard.flat().find((b: any) => b.web_app);
+      assert.ok(btn, "web_app button missing on the empty list");
+      assert.match(btn.web_app.url, /tab=terminal$/, "deep-link opens the terminal directly");
+      // Mini App not configured → the button disappears, text stays usable
+      h.app.config.webapp.url = "";
+      const off = (controller as any).sessionsSpec(USER_A);
+      assert.ok(!off.kb.inline_keyboard.flat().some((b: any) => b.web_app));
     } finally {
       await h.close();
     }

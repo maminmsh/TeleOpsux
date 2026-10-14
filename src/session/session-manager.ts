@@ -18,6 +18,10 @@ import {
   CREDENTIAL_IN_CHAT_MESSAGE,
 } from "../credentials/credential-service";
 import {
+  stageCredentialFile,
+  removeCredentialFile,
+} from "../credentials/launch-staging";
+import {
   SessionRecord,
   SessionStatus,
 } from "../shared/types";
@@ -77,6 +81,13 @@ export interface CreateSessionParams {
   cwd: string;
   task?: string;
   branch?: string;
+  /**
+   * Set when the UI layer already VALIDATED `cwd` against the active
+   * transport (canonical `pwd -P`, inside the user's own home) — e.g. a
+   * directory picked in the Mini App browser. Remote mode then honours this
+   * cwd instead of demanding a registered project.
+   */
+  cwd_trusted?: boolean;
   /** Telegram user that owns the session. NULL only for legacy/system rows. */
   owner_telegram_user_id?: number | null;
 }
@@ -194,9 +205,10 @@ export class SessionManager {
       throw new CredentialRequiredError();
 
     let cwd = params.cwd;
-    if (this.host) {
-      // Remote mode: sessions may only run inside registered projects of the
-      // active host; cwd always comes from the DB row, never from the caller.
+    if (this.host && !params.cwd_trusted) {
+      // Remote mode without a browser-validated cwd: sessions may only run
+      // inside registered projects of the active host, and the cwd always
+      // comes from the DB row, never from the caller.
       const project =
         params.project_id !== null ? this.db.getProject(params.project_id) : undefined;
       if (!project || project.host_id !== this.host.hostId)
@@ -204,6 +216,10 @@ export class SessionManager {
           "Sessions must run in a registered project of the active server. Use /addproject.",
         );
       cwd = project.root;
+    } else if (this.host && params.cwd_trusted) {
+      if (!params.cwd.startsWith("/") || params.cwd.length < 2)
+        throw new Error("Trusted cwd must be an absolute path on the active server.");
+      cwd = params.cwd;
     }
 
     if (this.activeCount() >= this.config.sessions.max_concurrent)
@@ -274,7 +290,7 @@ export class SessionManager {
       // produce "sh: 1: exec: qoder: not found" inside a live interactive shell.
       let resolvedCommand: string | undefined;
       if (adapter.executable) {
-        const res = await this.resolveExecutable(adapter.executable);
+        const res = await this.preflightExecutable(adapter.executable);
         if (!res.ok) return this.failStart(sessionId, res.error);
         resolvedCommand = res.path;
       }
@@ -298,7 +314,7 @@ export class SessionManager {
             throw new CredentialRequiredError();
           }
           secretFilePath = this.credentialFilePath(sessionId);
-          await this.stageCredentialFile(secretFilePath, key);
+          await stageCredentialFile(this.runner, secretFilePath, key);
           opts.secretFilePath = secretFilePath;
         }
         // the launch command IS the pane command — when the agent dies, the
@@ -360,7 +376,7 @@ export class SessionManager {
       this.ensurePolling();
       return this.mustGet(sessionId);
     } catch (e) {
-      if (secretFilePath) await this.removeCredentialFile(secretFilePath);
+      if (secretFilePath) await removeCredentialFile(this.runner, secretFilePath);
       if (this.db.getSession(sessionId)?.status === "STARTING") {
         // a frozen STARTING is as misleading as a false WORKING — record why
         this.db.updateSession(sessionId, {
@@ -387,7 +403,8 @@ export class SessionManager {
     message: string,
     opts: { output?: string; secretFilePath?: string } = {},
   ): never {
-    if (opts.secretFilePath) void this.removeCredentialFile(opts.secretFilePath);
+    if (opts.secretFilePath)
+      void removeCredentialFile(this.runner, opts.secretFilePath);
     const patch: Parameters<DB["updateSession"]>[1] = { waiting_reason: message.slice(0, 500) };
     if (opts.output && opts.output.trim()) patch.last_output = opts.output.slice(-4000);
     this.db.updateSession(sessionId, patch);
@@ -409,8 +426,10 @@ export class SessionManager {
    * path returned is what the pane then execs — the pane itself never relies
    * on PATH. The binary name comes from operator config (never user text) and
    * is passed as an ARGUMENT, so it cannot inject shell syntax.
+   * Public: the personal terminal preflights `qoder` through this exact path
+   * so a terminal-typed `qoder` behaves identically to a managed session.
    */
-  private async resolveExecutable(
+  async preflightExecutable(
     command: string,
   ): Promise<{ ok: true; path: string } | { ok: false; error: string }> {
     // MUST run on the same transport the pane will be created on — that is
@@ -454,7 +473,7 @@ export class SessionManager {
     this.transition(sessionId, "STOPPED");
     this.runtime.delete(sessionId);
     // best-effort: a crashed launch may have left the staged key on disk
-    await this.removeCredentialFile(this.credentialFilePath(sessionId));
+    await removeCredentialFile(this.runner, this.credentialFilePath(sessionId));
     this.bus.emit({ type: "SESSION_STOPPED", session_id: sessionId });
   }
 
@@ -571,29 +590,6 @@ export class SessionManager {
    */
   private credentialFilePath(sessionId: number): string {
     return `$HOME/.teleops-credentials/teleops-session-${sessionId}.key`;
-  }
-
-  /**
-   * Stage the owner's key into a 0600 file on the session host. The key is
-   * written through the runner's STDIN channel (`input`) — it never appears in
-   * argv, TeleOps process env, logs, or any output stream. The pane's launch
-   * command reads and deletes the file at start.
-   */
-  private async stageCredentialFile(pathExpr: string, key: string): Promise<void> {
-    const r = await this.runner.execScript(
-      `umask 077 && mkdir -p "$(dirname "${pathExpr}")" && cat > "${pathExpr}" && chmod 600 "${pathExpr}"`,
-      { input: key, timeoutMs: 20_000 },
-    );
-    if (r.code !== 0)
-      throw new Error("could not stage the credential file on the session host");
-  }
-
-  private async removeCredentialFile(pathExpr: string): Promise<void> {
-    try {
-      await this.runner.execScript(`rm -f "${pathExpr}"`, { timeoutMs: 15_000 });
-    } catch {
-      /* best-effort cleanup */
-    }
   }
 
   /** Best-effort: create .teleops/logs file (via pipe-pane) + task_logs row + memory entry. */

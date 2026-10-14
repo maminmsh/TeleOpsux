@@ -567,6 +567,13 @@ export class TelegramController {
     );
     const kb = new InlineKeyboard();
     for (const s of sessions) kb.text(`${s.id}. ${s.name}`, `sess:${s.id}`).row();
+    // The personal Linux Terminal is INDEPENDENT of AI sessions — offer it
+    // even on the empty list (the Mini App boots straight into the terminal).
+    const cfg = this.app.config.webapp;
+    if (cfg.enabled && cfg.url) {
+      const sep = cfg.url.includes("?") ? "&" : "?";
+      kb.webApp("🖥 Linux Terminal", `${cfg.url}${sep}tab=terminal`).row();
+    }
     kb.text("⬅ Back", "back");
     return { text: text.length > 4000 ? text.slice(0, 4000) : text, kb };
   }

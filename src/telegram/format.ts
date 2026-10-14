@@ -40,7 +40,8 @@ export function sessionsList(
   projectName: (id: number | null) => string | undefined,
   ownerLabel?: (s: SessionRecord) => string | undefined,
 ): string {
-  if (sessions.length === 0) return "🤖 AI SESSIONS\n\nNo sessions yet.\nUse /new to create one.";
+  if (sessions.length === 0)
+    return "🤖 AI SESSIONS\n\nNo sessions yet.\nUse /new to create one — or open the 🖥 Linux Terminal below.";
   const head = "🤖 AI SESSIONS\n";
   const body = sessions
     .map((s, i) =>

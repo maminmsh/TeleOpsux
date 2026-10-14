@@ -2,14 +2,20 @@ import { EventBus } from "../core/event-bus";
 import { DomainEvent } from "../shared/types";
 
 /**
- * In-memory live output buffer per session (docs §52 event flow, UI-side).
- * The EventBus keeps producing SESSION_OUTPUT chunks and lifecycle events;
- * the Mini App server subscribes here instead of polling tmux itself, so the
- * Telegram UI and the Web UI consume the SAME stream. Every line carries a
- * monotonically increasing per-session `seq`, which lets a reconnecting
- * client say "after=<seq>" and resume with no duplicates and no gaps (within
- * the ring's retention window).
+ * In-memory live output buffer per CHANNEL (docs §52 event flow, UI-side).
+ * Channels are string-keyed: `s<sessionId>` for the agent+system stream fed
+ * by the EventBus, and `t<telegramUserId>` for a user's PERSONAL terminal —
+ * the terminal is independent of AI sessions, so it must not share a ring
+ * with any session. The Mini App server subscribes here instead of polling
+ * tmux itself, so the Telegram UI and the Web UI consume the SAME stream.
+ * Every line carries a monotonically increasing per-channel `seq`, which lets
+ * a reconnecting client say "after=<seq>" and resume with no duplicates and
+ * no gaps (within the ring's retention window).
  */
+export type HubKey = string;
+
+export const sessionKey = (sessionId: number): HubKey => `s${sessionId}`;
+export const terminalKey = (userId: number): HubKey => `t${userId}`;
 
 export type LineSource = "agent" | "shell" | "system";
 
@@ -67,7 +73,7 @@ export function storedHistoryLines(
 }
 
 export class OutputHub {
-  private rings = new Map<number, Ring>();
+  private rings = new Map<HubKey, Ring>();
   private busHandler: (e: DomainEvent) => void;
 
   constructor(
@@ -85,29 +91,30 @@ export class OutputHub {
     this.bus.off("event", this.busHandler);
   }
 
-  private ring(id: number): Ring {
-    let r = this.rings.get(id);
+  private ring(key: HubKey): Ring {
+    let r = this.rings.get(key);
     if (!r) {
       r = { lines: [], nextSeq: 1, live: false, listeners: new Set() };
-      this.rings.set(id, r);
+      this.rings.set(key, r);
     }
     return r;
   }
 
   private onEvent(e: DomainEvent): void {
     if (e.session_id == null) return;
+    const key = sessionKey(e.session_id);
     if (e.type === "SESSION_OUTPUT") {
       const chunk = (e.payload?.chunk as string) ?? "";
-      if (chunk.trim()) this.append(e.session_id, "agent", chunk, true);
+      if (chunk.trim()) this.append(key, "agent", chunk, true);
       return;
     }
     const text = LIFECYCLE_TEXT[e.type];
-    if (text) this.append(e.session_id, "system", text, true);
+    if (text) this.append(key, "system", text, true);
   }
 
   /** Append one (possibly multi-line) block; returns the last assigned seq. */
-  append(sessionId: number, source: LineSource, text: string, markLive = false): number {
-    const r = this.ring(sessionId);
+  append(key: HubKey, source: LineSource, text: string, markLive = false): number {
+    const r = this.ring(key);
     const at = new Date().toISOString();
     const parts = this.sanitize(text).split("\n").slice(0, MAX_LINES_PER_APPEND);
     let seq = r.nextSeq - 1;
@@ -134,36 +141,36 @@ export class OutputHub {
    * pane tail `fallback` is seeded once so the client still sees context and
    * the `seq` cursor stays coherent for the follow-up live stream.
    */
-  snapshot(sessionId: number, count: number, fallback?: string): HubLine[] {
-    const r = this.ring(sessionId);
+  snapshot(key: HubKey, count: number, fallback?: string): HubLine[] {
+    const r = this.ring(key);
     if (!r.live && !r.lines.length && fallback && fallback.trim()) {
-      this.append(sessionId, "agent", fallback, false);
+      this.append(key, "agent", fallback, false);
     }
     return r.lines.slice(-count);
   }
 
   /** All retained lines with seq > afterSeq, in order. */
-  since(sessionId: number, afterSeq: number): HubLine[] {
-    const r = this.ring(sessionId);
+  since(key: HubKey, afterSeq: number): HubLine[] {
+    const r = this.ring(key);
     return r.lines.filter((l) => l.seq > afterSeq);
   }
 
-  lastSeq(sessionId: number): number {
-    return this.ring(sessionId).nextSeq - 1;
+  lastSeq(key: HubKey): number {
+    return this.ring(key).nextSeq - 1;
   }
 
-  subscribe(sessionId: number, listener: LineListener): () => void {
-    const r = this.ring(sessionId);
+  subscribe(key: HubKey, listener: LineListener): () => void {
+    const r = this.ring(key);
     r.listeners.add(listener);
     return () => r.listeners.delete(listener);
   }
 
-  subscriberCount(sessionId: number): number {
-    return this.ring(sessionId).listeners.size;
+  subscriberCount(key: HubKey): number {
+    return this.ring(key).listeners.size;
   }
 
-  /** Drop a session's buffer entirely (deleted session / shutdown). */
-  forget(sessionId: number): void {
-    this.rings.delete(sessionId);
+  /** Drop a channel's buffer entirely (deleted session / shutdown). */
+  forget(key: HubKey): void {
+    this.rings.delete(key);
   }
 }

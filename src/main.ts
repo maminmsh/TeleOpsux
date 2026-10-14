@@ -20,7 +20,7 @@ import { ServerModeService } from "./server/server-mode";
 import { App } from "./core/container";
 import { basename } from "./shared/paths";
 import { TelegramController } from "./telegram/bot";
-import { OutputHub } from "./web/output-hub";
+import { OutputHub, sessionKey } from "./web/output-hub";
 import { TerminalService } from "./web/terminal-service";
 import { MiniAppServer } from "./web/mini-app-server";
 import { redactSecrets } from "./auth/access";
@@ -132,11 +132,11 @@ async function main(): Promise<void> {
   const scrub = (t: string): string => credentials.redactAll(redactSecrets(t));
   const hub = new OutputHub(bus, scrub);
   const terminals = new TerminalService(app, hub);
-  // single deletion path shared by bot + Mini App: when a session is removed,
-  // its shell pane is killed and its live ring forgotten
+  // single deletion path shared by bot + Mini App: when a session is removed
+  // its live ring is forgotten. The PERSONAL terminal is independent of
+  // sessions — it is never dropped here; it survives until the user stops it.
   sessions.onDeleted((id) => {
-    terminals.drop(id);
-    hub.forget(id);
+    hub.forget(sessionKey(id));
   });
   let webapp: MiniAppServer | null = null;
   if (config.webapp.enabled && config.webapp.url && config.telegram.botToken) {

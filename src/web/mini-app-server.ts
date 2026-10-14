@@ -1,7 +1,7 @@
 import http from "node:http";
 import { App } from "../core/container";
-import { OutputHub, storedHistoryLines } from "./output-hub";
-import { TerminalService } from "./terminal-service";
+import { OutputHub, sessionKey, storedHistoryLines, terminalKey } from "./output-hub";
+import { resolveTransportHome, TerminalService } from "./terminal-service";
 import { validateInitData } from "./telegram-init-data";
 import { MINI_APP_HTML } from "./mini-app-page";
 import {
@@ -254,15 +254,50 @@ export class MiniAppServer {
     const uid = this.actor(req, res, write);
     if (uid === null) return;
 
-    // endpoints that do NOT address a session
-    switch (p) {
-      case "/api/meta":
+    // endpoints that do NOT address a session — the personal terminal is
+    // keyed by the initData-verified uid alone (independent of AI sessions)
+    switch (`${req.method} ${p}`) {
+      case "GET /api/meta":
         return this.meta(uid, res);
-      case "/api/sessions":
+      case "GET /api/sessions":
         return this.sessions(res, uid);
-      case "/api/session/create":
+      case "POST /api/session/create":
         return this.createSession(uid, req, res);
+      case "POST /api/terminal/start":
+        return this.action(uid, res, () => this.terminals.start(uid));
+      case "POST /api/terminal/input":
+        return this.action(uid, res, async () => {
+          const body = await this.readBody(req);
+          await this.terminals.sendText(uid, String(body.text ?? ""));
+          return { ok: true };
+        });
+      case "POST /api/terminal/key":
+        return this.action(uid, res, async () => {
+          const body = await this.readBody(req);
+          await this.terminals.sendKey(uid, String(body.key ?? ""));
+          return { ok: true };
+        });
+      case "POST /api/terminal/stop":
+        return this.action(uid, res, async () => {
+          await this.terminals.stop(uid);
+          return { ok: true };
+        });
+      case "GET /api/terminal/status":
+        return this.json(res, 200, this.terminals.status(uid));
+      case "GET /api/terminal/events":
+        return this.stream(uid, url, res, {
+          key: terminalKey(uid),
+          wants: (source) => source === "shell",
+          authorized: () => isAllowedUser(this.app, uid),
+        });
+      case "GET /api/browse":
+        return this.browse(uid, url, res);
     }
+    if (p.startsWith("/api/terminal/") || p === "/api/browse") {
+      this.json(res, 405, { error: "Method not allowed." });
+      return;
+    }
+
     const id = this.sessionIdFrom(url, req, res);
     if (id === null) return; // malformed / missing — already answered
     // SERVER-SIDE ownership gate for EVERY session-scoped endpoint. Client
@@ -278,14 +313,17 @@ export class MiniAppServer {
       case "GET /api/session/history":
         return this.history(id, res);
       case "GET /api/session/events":
-        return this.stream(uid, id, url, res, "agent");
-      case "GET /api/terminal/events":
-        return this.stream(uid, id, url, res, "shell");
+        return this.stream(uid, url, res, {
+          key: sessionKey(id),
+          wants: (source) => source !== "shell",
+          authorized: () => resolveSession(this.app, uid, id) !== null,
+          statusSessionId: id,
+        });
       case "POST /api/session/delete":
         return this.action(uid, res, async () => {
           // ONE delete path shared with the bot (ownership already enforced by
-          // the central gate above): stop agent + drop shell + stored history
-          // all happen inside SessionManager.remove via its deletion hooks.
+          // the central gate above): stop agent + stored history all happen
+          // inside SessionManager.remove via its deletion hooks.
           await this.app.sessions.remove(id);
           return { ok: true, deleted: id };
         });
@@ -306,25 +344,6 @@ export class MiniAppServer {
         return this.action(uid, res, async () => {
           const s = await this.app.sessions.resume(id);
           return { ok: true, status: s.status };
-        });
-      case "POST /api/terminal/start":
-        return this.action(uid, res, async () => this.terminals.start(uid, id));
-      case "POST /api/terminal/input":
-        return this.action(uid, res, async () => {
-          const body = await this.readBody(req);
-          await this.terminals.sendText(uid, id, String(body.text ?? ""));
-          return { ok: true };
-        });
-      case "POST /api/terminal/key":
-        return this.action(uid, res, async () => {
-          const body = await this.readBody(req);
-          await this.terminals.sendKey(uid, id, String(body.key ?? ""));
-          return { ok: true };
-        });
-      case "POST /api/terminal/stop":
-        return this.action(uid, res, async () => {
-          this.terminals.stop(uid, id);
-          return { ok: true };
         });
       default:
         this.json(res, 404, { error: "not found" });
@@ -405,7 +424,7 @@ export class MiniAppServer {
       return;
     }
     const s = resolveSession(this.app, uid, id)!;
-    const lines = this.hub.snapshot(id, 50, s.last_output ?? undefined).map((l) => ({
+    const lines = this.hub.snapshot(sessionKey(id), 50, s.last_output ?? undefined).map((l) => ({
       seq: l.seq,
       at: l.at,
       source: l.source,
@@ -415,7 +434,6 @@ export class MiniAppServer {
       ...meta,
       lines,
       last_seq: lines.length ? lines[lines.length - 1]!.seq : 0,
-      terminal: this.terminals.status(id),
     });
   }
 
@@ -445,20 +463,39 @@ export class MiniAppServer {
       const pidRaw = body.project_id;
       const projectId =
         typeof pidRaw === "number" && Number.isSafeInteger(pidRaw) ? pidRaw : null;
+      const rawCwd = typeof body.cwd === "string" ? body.cwd : "";
+      if (projectId !== null && rawCwd !== "")
+        throw new Error("Choose EITHER a registered project OR your own directory — not both.");
       const project =
         projectId !== null ? resolveProject(this.app, uid, projectId) : null;
       if (projectId !== null && !project) throw new Error(DENY_MESSAGE);
-      if (!project && !isAdminUser(this.app, uid))
-        throw new Error("Pick one of your projects — free-form sessions are admin-only.");
+      // A browser-picked directory is validated on the transport (must be a
+      // real dir inside the user's own $HOME) — any allowed user may run a
+      // session there. Without either, only admins get an adhoc session.
+      let cwd: string;
+      let cwdTrusted = false;
+      if (rawCwd !== "") {
+        cwd = (await this.canonicalDir(rawCwd)).dir;
+        cwdTrusted = true;
+      } else if (project) {
+        cwd = project.root;
+      } else if (isAdminUser(this.app, uid)) {
+        cwd = process.cwd();
+      } else {
+        throw new Error(
+          "Pick one of your projects or browse to your own directory — free-form sessions are admin-only.",
+        );
+      }
+      const dirLabel = cwdTrusted ? cwd.split("/").pop() || cwd : project?.name ?? "adhoc";
       // Every gate (credential fail-closed, host/project rules, concurrency)
       // runs inside SessionManager.create/start — this is the SAME path the
       // Telegram wizard uses, not a parallel implementation.
-      const cwd = project?.root ?? process.cwd();
       const created = await this.app.sessions.create({
-        name: `${agent} - ${project?.name ?? "adhoc"}`,
+        name: `${agent} - ${dirLabel}`,
         project_id: project?.id ?? null,
         agent,
         cwd,
+        cwd_trusted: cwdTrusted,
         owner_telegram_user_id: uid,
       });
       await this.app.sessions.start(created.id, task || undefined);
@@ -467,26 +504,30 @@ export class MiniAppServer {
   }
 
   /**
-   * SSE live stream. Ownership was checked at connect; it is RE-CHECKED for
-   * every pushed event, so a revoked session stops streaming immediately.
-   * Replay uses the hub's `seq` cursor: the client sends `after=<last seq>`
-   * and receives exactly the lines it missed — no duplicates, no gaps.
+   * SSE live stream over ANY hub channel (session `s<id>` or personal
+   * terminal `t<uid>`). Authorization is checked at connect and RE-CHECKED
+   * for every pushed event via `authorized()`, so a revoked viewer stops
+   * streaming immediately. Replay uses the channel's `seq` cursor: the client
+   * sends `after=<last seq>` and receives exactly the lines it missed — no
+   * duplicates, no gaps.
    */
   private stream(
     uid: number,
-    id: number,
     url: URL,
     res: http.ServerResponse,
-    kind: "agent" | "shell",
+    opts: {
+      key: string;
+      wants: (source: string) => boolean;
+      authorized: () => boolean;
+      /** Session id for lifecycle `status` events; omitted for terminals. */
+      statusSessionId?: number;
+    },
   ): void {
-    if (!resolveSession(this.app, uid, id)) {
+    if (!opts.authorized()) {
       this.json(res, 403, { error: DENY_MESSAGE });
       return;
     }
     const after = Math.max(0, Number(url.searchParams.get("after") ?? "0") || 0);
-    // agent view = agent+system lines; terminal view = shell lines only
-    const wants = (source: string): boolean =>
-      kind === "shell" ? source === "shell" : source !== "shell";
     res.writeHead(200, {
       "content-type": "text/event-stream",
       "cache-control": "no-cache, no-transform",
@@ -509,14 +550,13 @@ export class MiniAppServer {
     };
 
     // replay retained lines of this kind (seq cursor → no duplicates on resume)
-    for (const l of this.hub.since(id, after)) {
-      if (!wants(l.source)) continue;
+    for (const l of this.hub.since(opts.key, after)) {
+      if (!opts.wants(l.source)) continue;
       send("line", { seq: l.seq, at: l.at, source: l.source, text: this.scrub(l.text) });
     }
-    const ownedNow = (): boolean => resolveSession(this.app, uid, id) !== null;
-    const unsubLine = this.hub.subscribe(id, (chunk) => {
-      if (!wants(chunk.source)) return;
-      if (!ownedNow()) return end(); // ownership revoked mid-stream
+    const unsubLine = this.hub.subscribe(opts.key, (chunk) => {
+      if (!opts.wants(chunk.source)) return;
+      if (!opts.authorized()) return end(); // access revoked mid-stream
       send("line", {
         seq: chunk.seq,
         at: chunk.at,
@@ -526,9 +566,10 @@ export class MiniAppServer {
     });
 
     const busHandler = (e: DomainEvent): void => {
-      if (e.session_id !== id || !STATUS_EVENTS.has(e.type)) return;
-      if (!ownedNow()) return end();
-      const s = this.app.db.getSession(id);
+      if (opts.statusSessionId == null || e.session_id !== opts.statusSessionId) return;
+      if (!STATUS_EVENTS.has(e.type)) return;
+      if (!opts.authorized()) return end();
+      const s = this.app.db.getSession(opts.statusSessionId);
       if (s) send("status", { status: s.status, waiting_reason: s.waiting_reason });
     };
     this.app.bus.on("event", busHandler);
@@ -540,5 +581,59 @@ export class MiniAppServer {
 
     res.on("close", end);
     res.on("error", end);
+  }
+
+  // ---------- directory browser ----------
+
+  /**
+   * Canonicalize a user-supplied candidate path ON THE ACTIVE TRANSPORT and
+   * pin it inside the transport user's own $HOME. `cd` resolves `..` and
+   * symlinks, `pwd -P` yields the physical path, and the path is passed as a
+   * shell ARGUMENT (never interpolated), so nothing here injects commands.
+   */
+  private async canonicalDir(raw: string): Promise<{ home: string; dir: string }> {
+    if (raw.length > 1024 || /[\u0000-\u001f\u007f]/.test(raw))
+      throw new Error("Invalid path.");
+    const home = await resolveTransportHome(this.app);
+    const candidate =
+      raw === "" || raw === "." ? home : `${home}/${raw.replace(/^\/+/, "").replace(/^~\/?/, "")}`;
+    const r = await this.app.sessions.tmuxTransport.execRunner.exec(
+      "sh",
+      ["-lc", 'cd "$1" 2>/dev/null && pwd -P', "teleops-browse", candidate],
+      { timeoutMs: 20_000 },
+    );
+    const dir = (r.stdout || "").split("\n")[0]?.trim() ?? "";
+    if (r.code !== 0 || !dir.startsWith("/"))
+      throw new Error(`Not a readable directory: ${raw || home}`);
+    if (dir !== home && !dir.startsWith(`${home}/`))
+      throw new Error("Access is restricted to your own home directory on this server.");
+    return { home, dir };
+  }
+
+  private async browse(uid: number, url: URL, res: http.ServerResponse): Promise<void> {
+    await this.action(uid, res, async () => {
+      const raw = url.searchParams.get("path") ?? "";
+      const { home, dir } = await this.canonicalDir(raw);
+      const r = await this.app.sessions.tmuxTransport.execRunner.exec(
+        "ls",
+        ["-1", "F", "--", dir],
+        { timeoutMs: 20_000 },
+      );
+      if (r.code !== 0)
+        throw new Error(`Directory listing failed: ${(r.stderr || "").trim().slice(0, 200) || dir}`);
+      const dirs = r.stdout
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l.endsWith("/"))
+        .map((l) => l.slice(0, -1))
+        .filter((l) => l && l !== "." && l !== "..")
+        .sort((a, b) => a.localeCompare(b));
+      return {
+        path: dir,
+        home,
+        parent: dir === home ? null : dir.slice(0, dir.lastIndexOf("/")) || "/",
+        dirs,
+      };
+    });
   }
 }
