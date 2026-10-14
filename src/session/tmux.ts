@@ -146,6 +146,20 @@ export class Tmux {
     return r.code === 0 ? r.stdout : "";
   }
 
+  async resizePane(name: string, cols: number, rows: number): Promise<void> {
+    const safeCols = Math.max(10, Math.min(500, Math.floor(cols)));
+    const safeRows = Math.max(5, Math.min(200, Math.floor(rows)));
+    await this.runner.exec("tmux", [
+      "resize-window",
+      "-t",
+      this.qualified(name),
+      "-x",
+      String(safeCols),
+      "-y",
+      String(safeRows),
+    ]);
+  }
+
   async killSession(name: string): Promise<void> {
     await this.runner.exec("tmux", ["kill-session", "-t", this.qualified(name)]);
   }

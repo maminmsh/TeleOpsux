@@ -559,6 +559,27 @@ export class SessionManager {
     }
   }
 
+  async sendKey(sessionId: number, key: string): Promise<void> {
+    const session = this.mustGet(sessionId);
+    if (!(await this.tmux.isAlive(String(sessionId))))
+      throw new Error(
+        `The process in session #${sessionId} is no longer running.`,
+      );
+    await this.tmux.sendKey(String(sessionId), key);
+    const rt = this.runtime.get(sessionId);
+    if (rt) {
+      rt.lastActivityMs = Date.now();
+      rt.idleReported = false;
+    }
+  }
+
+  async resize(sessionId: number, cols: number, rows: number): Promise<void> {
+    const session = this.mustGet(sessionId);
+    if (await this.tmux.exists(String(sessionId))) {
+      await this.tmux.resizePane(String(sessionId), cols, rows);
+    }
+  }
+
   async capture(sessionId: number, lines = 200): Promise<string> {
     return this.tmux.capturePane(String(sessionId), lines);
   }
@@ -730,6 +751,16 @@ export class SessionManager {
       }
     }
     this.ensurePolling();
+  }
+
+  /** Reconcile database state with active tmux panes and runtime registry. */
+  async reconcile(): Promise<{ sessions: number; active: number }> {
+    await this.recover();
+    const all = this.db.listSessions();
+    const active = all.filter((s) =>
+      ["STARTING", "WORKING", "WAITING_INPUT", "WAITING_APPROVAL"].includes(s.status),
+    ).length;
+    return { sessions: all.length, active };
   }
 
   private ensurePolling(): void {

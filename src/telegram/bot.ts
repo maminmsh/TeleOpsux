@@ -3,15 +3,19 @@ import { App } from "../core/container";
 import { DomainEvent, SessionRecord } from "../shared/types";
 import {
   ago,
+  agoFa,
   gitStatusText,
   processesList,
   serverStatus,
   serverStatusExtended,
   sessionsList,
+  statusFarsi,
 } from "./format";
+import { ACTIVE_STATUSES } from "../session/state-machine";
 import { shq } from "../exec/exec-runner";
 import { basename } from "../shared/paths";
 import path from "node:path";
+import fs from "node:fs";
 import {
   DENY_MESSAGE,
   canManageProject,
@@ -42,15 +46,32 @@ interface Wizard {
 }
 
 interface ServerWizard {
-  step: "host" | "port" | "user" | "pass";
-  draft: { host?: string; port?: number; username?: string };
+  step: "name" | "host" | "port" | "user" | "auth_type" | "credential" | "pass";
+  draft: {
+    name?: string;
+    host?: string;
+    port?: number;
+    username?: string;
+    auth_type?: "password" | "key";
+  };
+}
+
+interface SessionCreationWizard {
+  step: "server" | "project" | "mode" | "name" | "task";
+  hostId?: number;
+  projectId?: number;
+  agent?: string;
+  name?: string;
 }
 
 interface UserState {
   activeSession?: number;
   wizard?: Wizard;
   serverWizard?: ServerWizard;
-  projectWizard?: boolean;
+  projectWizard?: boolean | { hostId?: number };
+  sessionWizard?: SessionCreationWizard;
+  pendingRename?: { type: "server" | "project" | "session"; id: number };
+  pendingInput?: { sessionId: number };
   liveMessageId?: number;
   /**
    * The ONE persistent navigation message. Menu screens are EDITED in place
@@ -88,6 +109,8 @@ export class TelegramController {
   private state = new Map<number, UserState>();
   private liveTimer?: NodeJS.Timeout;
   private liveState = new Map<number, string>();
+  private lastUserTap = new Map<number, number>();
+  private lastUserData = new Map<number, string>();
 
   constructor(private app: App) {
     this.bot = new Bot(app.config.telegram.botToken);
@@ -122,7 +145,13 @@ export class TelegramController {
   private st(userId: number): UserState {
     let s = this.state.get(userId);
     if (!s) {
-      s = {};
+      const persisted = this.app.db.getUserDashboard?.(userId);
+      s = {
+        dashboard: persisted
+          ? { chatId: persisted.chat_id, messageId: persisted.message_id, key: persisted.screen_key }
+          : undefined,
+        navStack: persisted?.nav_stack ? JSON.parse(persisted.nav_stack) : [],
+      };
       this.state.set(userId, s);
     }
     return s;
@@ -137,6 +166,13 @@ export class TelegramController {
       err?.error_code === 400 &&
       (err.description ?? "").toLowerCase().includes("not modified")
     );
+  }
+
+  private navFooter(kb: InlineKeyboard, showBack = true, showMain = true): InlineKeyboard {
+    const row = kb.row();
+    if (showBack) row.text("⬅️ بازگشت", "back");
+    if (showMain) row.text("🏠 منوی اصلی", "menu:main");
+    return kb;
   }
 
   /**
@@ -160,6 +196,7 @@ export class TelegramController {
       try {
         await ctx.editMessageText(text, opts);
         state.dashboard = { chatId: cbMsg.chat.id, messageId: cbMsg.message_id, key };
+        this.persistDashboard(ctx.from!.id, state);
         return;
       } catch (e) {
         // "message is not modified" means the dashboard ALREADY shows this
@@ -171,6 +208,7 @@ export class TelegramController {
             messageId: cbMsg.message_id,
             key,
           };
+          this.persistDashboard(ctx.from!.id, state);
           return;
         }
       }
@@ -180,10 +218,12 @@ export class TelegramController {
       try {
         await this.bot.api.editMessageText(dash.chatId, dash.messageId, text, opts);
         dash.key = key;
+        this.persistDashboard(ctx.from!.id, state);
         return;
       } catch (e) {
         if (TelegramController.isNotModified(e)) {
           dash.key = key;
+          this.persistDashboard(ctx.from!.id, state);
           return;
         }
         state.dashboard = undefined; // deleted / no longer editable
@@ -194,8 +234,23 @@ export class TelegramController {
     try {
       const sent = await ctx.reply(text, opts);
       state.dashboard = { chatId, messageId: sent.message_id, key };
+      this.persistDashboard(ctx.from!.id, state);
     } catch {
       /* chat unavailable (bot blocked) — nothing sane left to do */
+    }
+  }
+
+  private persistDashboard(userId: number, state: UserState): void {
+    if (state.dashboard) {
+      try {
+        this.app.db.upsertUserDashboard?.(
+          userId,
+          state.dashboard.chatId,
+          state.dashboard.messageId,
+          state.dashboard.key,
+          JSON.stringify(state.navStack ?? []),
+        );
+      } catch {}
     }
   }
 
@@ -206,10 +261,6 @@ export class TelegramController {
    */
   private async navigate(ctx: Context, uid: number, key: string): Promise<void> {
     const state = this.st(uid);
-    if (key === "logs") {
-      await this.showLogs(ctx, state.activeSession);
-      return;
-    }
     const ADMIN_SCREENS = new Set(["server", "processes", "health", "alerts", "settings"]);
     if (ADMIN_SCREENS.has(key) && !(await this.requireAdmin(ctx))) return;
     const spec = await this.screenSpec(ctx, uid, key);
@@ -243,71 +294,123 @@ export class TelegramController {
     key: string,
   ): Promise<{ text: string; kb?: InlineKeyboard } | undefined> {
     const app = this.app;
-    const back = (kb: InlineKeyboard): InlineKeyboard => {
-      kb.row().text("⬅ Back", "back");
-      return kb;
-    };
-    switch (key) {
-      case "main":
-        return {
-          text: "🤖 AI COMMAND CENTER\nChoose an option:",
-          kb: this.mainMenu(isAdminUser(app, uid)),
-        };
-      case "sessions":
-        return this.sessionsSpec(uid);
-      case "hosts":
-        return this.hostsSpec(uid);
-      case "projects": {
-        const ps = isAdminUser(app, uid)
-          ? app.db.listProjects()
-          : app.db.listProjectsForOwner(uid);
-        const lines = ps.map((p) => {
-          const host = p.host_id ? app.hosts.getHost(p.host_id) : undefined;
-          return `${p.id}. ${p.name}  [${host ? `remote @ ${host.host}` : "local"}]  ${p.root}`;
-        });
-        return {
-          text: "📁 Projects\n\n" + (lines.join("\n") || "none — /addproject to register"),
-          kb: back(new InlineKeyboard().text("➕ Add Project", "nav:addproject")),
-        };
-      }
-      case "server": {
-        const counts = this.sessionCounts(uid);
-        const full = app.monitor.fullReport
-          ? await app.monitor.fullReport().catch(() => null)
-          : null;
-        return {
-          text: full
-            ? serverStatusExtended(full, counts)
-            : serverStatus(await app.monitor.metrics(), counts),
-          kb: back(new InlineKeyboard()),
-        };
-      }
-      case "processes":
-        return {
-          text: processesList(await app.monitor.topProcesses()),
-          kb: back(new InlineKeyboard()),
-        };
-      case "health":
-        return { text: this.healthText(), kb: back(new InlineKeyboard()) };
-      case "alerts":
-        return {
-          text: "Use /alerts for the current alert + approval summary.",
-          kb: back(new InlineKeyboard()),
-        };
-      case "settings":
-        return {
-          text:
-            "⚙️ Settings\nmax_concurrent: " +
-            app.config.sessions.max_concurrent +
-            "\nagents: " +
-            app.adapters.ids().join(", "),
-          kb: back(new InlineKeyboard()),
-        };
-      case "qoderkey":
-        return this.qoderKeySpec(uid);
-      default:
-        return undefined;
+    if (key === "main") {
+      return {
+        text: "🤖 AI COMMAND CENTER\n\nبه مرکز مدیریت و کنترل TeleOps خوش آمدید.\nجهت دسترسی به بخش‌های مختلف از دکمه‌های زیر استفاده کنید:",
+        kb: this.mainMenu(isAdminUser(app, uid)),
+      };
     }
+    if (key === "sessions") return this.sessionsSpec(uid);
+    if (key === "hosts") return this.hostsSpec(uid);
+    if (key.startsWith("hostdetail:")) {
+      const id = Number(key.split(":")[1]);
+      return this.hostDetailSpec(uid, id);
+    }
+    if (key.startsWith("hostdelreq:")) {
+      const id = Number(key.split(":")[1]);
+      return this.hostDelReqSpec(uid, id);
+    }
+    if (key === "projects") {
+      const ps = isAdminUser(app, uid)
+        ? app.db.listProjects()
+        : app.db.listProjectsForOwner(uid);
+      const defProjId = app.db.getUserDefaultProjectId?.(uid);
+      const kb = new InlineKeyboard();
+      kb.text("➕ ثبت پروژه جدید", "projnew:start").row();
+      if (!ps.length) {
+        this.navFooter(kb, true, true);
+        return {
+          text: "📁 پروژه‌ها (Projects)\n\nهیچ پروژه‌ای هنوز ثبت نشده است.\nبرای شروع، دکمه «ثبت پروژه جدید» را بزنید.",
+          kb,
+        };
+      }
+      const lines = ps.map((p) => {
+        const host = p.host_id ? app.hosts.getHost(p.host_id) : undefined;
+        const isDef = p.id === defProjId;
+        const marker = isDef ? "⭐" : "▫️";
+        kb.text(`${marker} ${p.name} [${host ? host.name : "local"}]`, `projdetail:${p.id}`).row();
+        return `${marker} #${p.id} ${p.name}\n   └ سرور: ${host ? `${host.name} (${host.host})` : "لوکال"}\n   └ مسیر: ${p.root}`;
+      });
+      this.navFooter(kb, true, true);
+      return {
+        text: "📁 مدیریت پروژه‌ها (Projects)\n\n" + lines.join("\n\n") + "\n\nجهت مشاهده جزئیات یا سشن‌ها روی پروژه کلیک کنید:",
+        kb,
+      };
+    }
+    if (key.startsWith("projdetail:")) {
+      const id = Number(key.split(":")[1]);
+      return this.projDetailSpec(uid, id);
+    }
+    if (key.startsWith("projdelreq:")) {
+      const id = Number(key.split(":")[1]);
+      return this.projDelReqSpec(uid, id);
+    }
+    if (key.startsWith("sess:")) {
+      const id = Number(key.split(":")[1]);
+      const s = resolveSession(app, uid, id);
+      if (!s) return undefined;
+      const out = await app.sessions.capture(id, 40);
+      const kb = this.sessionKb(id);
+      this.navFooter(kb, true, true);
+      return {
+        text:
+          `💬 سشن #${s.id}: ${s.name}\n` +
+          `━━━━━━━━━━━━━━━━━━━━\n` +
+          `• وضعیت: ${statusFarsi(s.status)} (${s.status})\n` +
+          `• ایجنت: ${s.agent_type}\n` +
+          `• پروژه: ${this.projectName(s.project_id) ?? "—"}\n` +
+          `• آخرین فعالیت: ${agoFa(s.updated_at)}\n\n` +
+          `Recent output:\n${this.clip(this.scrub(out)) || "(no output yet)"}`,
+        kb,
+      };
+    }
+    if (key.startsWith("delreq:")) {
+      const id = Number(key.split(":")[1]);
+      const s = resolveSession(app, uid, id);
+      if (!s) return undefined;
+      const kb = new InlineKeyboard()
+        .text("✅ Yes, delete", `del:${id}`)
+        .text("⬅ Cancel", `sess:${id}`);
+      return {
+        text:
+          `⚠️ Delete session #${id} (${this.scrub(s.name)})?\n` +
+          `This stops the agent, closes the shell and removes ALL stored history. Cannot be undone.`,
+        kb,
+      };
+    }
+    if (key === "logs") return this.logsMenuSpec(uid);
+    if (key.startsWith("logsview:")) {
+      const type = key.split(":")[1] || "system";
+      return this.logsViewSpec(uid, type);
+    }
+    if (key === "settings") return this.settingsMenuSpec(uid);
+    if (key.startsWith("set:")) {
+      const type = key.split(":")[1] || "info";
+      return this.settingsSubSpec(uid, type);
+    }
+    if (key === "server") {
+      const counts = this.sessionCounts(uid);
+      const full = app.monitor.fullReport ? await app.monitor.fullReport().catch(() => null) : null;
+      const kb = this.navFooter(new InlineKeyboard(), true, true);
+      return {
+        text: full ? serverStatusExtended(full, counts) : serverStatus(await app.monitor.metrics(), counts),
+        kb,
+      };
+    }
+    if (key === "processes") {
+      const kb = this.navFooter(new InlineKeyboard(), true, true);
+      return { text: processesList(await app.monitor.topProcesses()), kb };
+    }
+    if (key === "health") {
+      const kb = this.navFooter(new InlineKeyboard(), true, true);
+      return { text: this.healthText(), kb };
+    }
+    if (key === "alerts") {
+      const kb = this.navFooter(new InlineKeyboard(), true, true);
+      return { text: "Use /alerts for the current alert + approval summary.", kb };
+    }
+    if (key === "qoderkey") return this.qoderKeySpec(uid);
+    return undefined;
   }
 
   /**
@@ -327,7 +430,16 @@ export class TelegramController {
       const sep = cfg.url.includes("?") ? "&" : "?";
       kb.webApp("🖥 Live Session Terminal", `${cfg.url}${sep}session=${sessionId}`).row();
     }
+    const s = this.app.db.getSession(sessionId);
+    const isStopped = s?.status === "STOPPED";
     kb.text("📜 Last 50 lines", `hist50:${sessionId}`)
+      .text("🔄 بروزرسانی خروجی", `sessrefresh:${sessionId}`).row()
+      .text("⌨️ ارسال ورودی", `sessin:${sessionId}`)
+      .text("🛑 ارسال Ctrl+C", `sessctrlc:${sessionId}`).row()
+      .text(isStopped ? "▶ ادامه سشن" : "⏹ توقف سشن", isStopped ? `sessresume:${sessionId}` : `sessstopreq:${sessionId}`)
+      .text("🌿 وضعیت Git", `git:${sessionId}`).row()
+      .text("📋 لاگ‌های تسک", `loglist:${sessionId}`)
+      .text("✏️ تغییر نام سشن", `sessrename:${sessionId}`).row()
       .text("🗑 Delete session", `delreq:${sessionId}`);
     return kb;
   }
@@ -539,20 +651,13 @@ export class TelegramController {
     return lines.filter((l): l is string => l !== null).join("\n");
   }
 
-  private mainMenu(admin: boolean): InlineKeyboard {
-    const kb = new InlineKeyboard()
-      .text("🧠 Sessions", "nav:sessions").row()
-      .text("➕ New Session", "nav:new").row()
-      .text("📁 Projects", "nav:projects").text("🌿 Git", "nav:git").row()
-      .text("🖥 My Servers", "nav:hosts").text("📜 Logs", "nav:logs").row()
-      .text("🔑 Qoder Key", "nav:qoderkey").row()
-      .text("➕ Add Server", "nav:addserver").text("📁 Add Project", "nav:addproject").row();
-    if (admin)
-      kb
-        .text("🖥 Server Status", "nav:server").text("📟 Processes", "nav:processes").row()
-        .text("⚠️ Alerts", "nav:alerts").text("🩺 Health", "nav:health").row()
-        .text("⚙️ Settings", "nav:settings");
-    return kb;
+  private mainMenu(_admin?: boolean): InlineKeyboard {
+    return new InlineKeyboard()
+      .text("🖥 سرورها", "nav:hosts")
+      .text("📁 پروژه‌ها", "nav:projects").row()
+      .text("🧩 سشن‌ها", "nav:sessions")
+      .text("📜 لاگ‌ها", "nav:logs").row()
+      .text("⚙️ تنظیمات", "nav:settings");
   }
 
   private sessionsSpec(uid: number): { text: string; kb: InlineKeyboard } {
@@ -566,15 +671,17 @@ export class TelegramController {
       admin ? (s) => (s.owner_telegram_user_id == null ? "legacy · unowned" : `owner ${s.owner_telegram_user_id}`) : undefined,
     );
     const kb = new InlineKeyboard();
-    for (const s of sessions) kb.text(`${s.id}. ${s.name}`, `sess:${s.id}`).row();
-    // The personal Linux Terminal is INDEPENDENT of AI sessions — offer it
-    // even on the empty list (the Mini App boots straight into the terminal).
+    for (const s of sessions) {
+      const statusIcon = s.status === "WORKING" ? "🟢" : s.status === "STOPPED" ? "⏹" : s.status === "ERROR" || s.status === "CRASHED" ? "🔴" : "🟡";
+      kb.text(`${statusIcon} #${s.id} ${s.name}`, `sess:${s.id}`).row();
+    }
+    kb.text("➕ ایجاد سشن جدید", "sessnew:start").row();
     const cfg = this.app.config.webapp;
     if (cfg.enabled && cfg.url) {
       const sep = cfg.url.includes("?") ? "&" : "?";
       kb.webApp("🖥 Linux Terminal", `${cfg.url}${sep}tab=terminal`).row();
     }
-    kb.text("⬅ Back", "back");
+    this.navFooter(kb, true, true);
     return { text: text.length > 4000 ? text.slice(0, 4000) : text, kb };
   }
 
@@ -593,20 +700,327 @@ export class TelegramController {
     const state = this.st(uid);
     state.activeSession = sessionId;
     const out = await this.app.sessions.capture(sessionId, 40);
-    const key = `chat:${sessionId}`;
+    const key = `sess:${sessionId}`;
     const prev = state.dashboard?.key;
     if (prev && prev !== key)
       state.navStack = [...(state.navStack ?? []), prev].slice(-12);
     const kb = this.sessionKb(sessionId);
-    kb.row().text("⬅ Back", "back");
+    this.navFooter(kb, true, true);
     await this.screen(
       ctx,
       key,
-      `💬 Chatting with ${s.agent_type} #${s.id} (${s.status})\n` +
-        `Send any message to forward it to the agent.\n\n` +
-        `Recent output:\n${this.clip(this.scrub(out)) || "(no output yet)"}`,
+      `💬 سشن #${s.id}: ${s.name}\n` +
+        `━━━━━━━━━━━━━━━━━━━━\n` +
+        `• وضعیت: ${statusFarsi(s.status)} (${s.status})\n` +
+        `• ایجنت: ${s.agent_type}\n` +
+        `• پروژه: ${this.projectName(s.project_id) ?? "—"}\n` +
+        `• شاخه Git: ${s.branch ?? "—"}\n` +
+        `• آخرین فعالیت: ${agoFa(s.updated_at)}\n\n` +
+        `خروجی اخیر (Recent output):\n${this.clip(this.scrub(out)) || "(بدون خروجی)"}`,
       kb,
     );
+  }
+
+  private async hostDetailSpec(uid: number, hostId: number): Promise<{ text: string; kb: InlineKeyboard } | undefined> {
+    const host = resolveHost(this.app, uid, hostId);
+    if (!host) return undefined;
+    const active = this.hostIdForUser(uid);
+    const isAct = host.id === active;
+    const projects = this.app.db.listRemoteProjects(host.id).filter((p) => projectVisibleTo(this.app, uid, p));
+    const allSessions = isAdminUser(this.app, uid) ? this.app.db.listSessions() : this.app.db.listSessionsForOwner(uid);
+    const hostSessions = allSessions.filter((s) => s.project_id && projects.some((p) => p.id === s.project_id));
+    const kb = new InlineKeyboard();
+    kb.text("⚡ تست اتصال SSH", `hosttest:${host.id}`)
+      .text(isAct ? "⭐ سرور فعال است" : "⭐ انتخاب به‌عنوان فعال", `hostuse:${host.id}`).row()
+      .text(`📁 پروژه‌ها (${projects.length})`, `hostprojs:${host.id}`)
+      .text(`🧩 سشن‌ها (${hostSessions.length})`, `hostsess:${host.id}`).row()
+      .text("✏️ تغییر نام سرور", `hostrename:${host.id}`)
+      .text("🗑 حذف سرور", `hostdelreq:${host.id}`).row();
+    this.navFooter(kb, true, true);
+
+    const authLabel = host.auth_type === "key" ? "🔑 کلید اختصاصی SSH (Private Key)" : "🔒 رمز عبور (Password)";
+    const connStatus = host.last_connected_at ? `✅ آخرین اتصال: ${agoFa(host.last_connected_at)}` : "⚪ هنوز بررسی نشده";
+    const lastErr = host.last_error ? `\n⚠️ خطای آخر اتصال: ${host.last_error}` : "";
+
+    const text =
+      `🖥 مشخصات سرور: ${host.name}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `• شناسه: #${host.id}\n` +
+      `• آدرس سرور: ${host.host}:${host.port}\n` +
+      `• نام کاربری: ${host.username}\n` +
+      `• شیوه احراز هویت: ${authLabel}\n` +
+      `• وضعیت پیش‌فرض: ${isAct ? "⭐ سرور جاری شما" : "خیر"}\n` +
+      `• وضعیت ارتباط: ${connStatus}${lastErr}\n` +
+      `• پروژه‌های مرتبط: ${projects.length}\n` +
+      `• سشن‌های فعال: ${hostSessions.filter((s) => ACTIVE_STATUSES.includes(s.status)).length} از ${hostSessions.length}`;
+
+    return { text, kb };
+  }
+
+  private hostDelReqSpec(uid: number, hostId: number): { text: string; kb: InlineKeyboard } | undefined {
+    const host = resolveHost(this.app, uid, hostId);
+    if (!host) return undefined;
+    const projects = this.app.db.listRemoteProjects(host.id).filter((p) => projectVisibleTo(this.app, uid, p));
+    const allSessions = isAdminUser(this.app, uid) ? this.app.db.listSessions() : this.app.db.listSessionsForOwner(uid);
+    const activeSessions = allSessions.filter(
+      (s) => s.project_id && projects.some((p) => p.id === s.project_id) && ACTIVE_STATUSES.includes(s.status),
+    );
+    const kb = new InlineKeyboard();
+    kb.text("✅ بله، سرور حذف شود", `hostdel:${host.id}`)
+      .text("❌ انصراف", `hostdetail:${host.id}`).row();
+    this.navFooter(kb, true, true);
+
+    let warning = "";
+    if (activeSessions.length > 0) {
+      warning = `\n\n⚠️ هشدار: ${activeSessions.length} سشن فعال روی پروژه‌های این سرور در حال اجرا هستند! ابتدا آن‌ها را متوقف کنید.`;
+    }
+
+    const text =
+      `⚠️ تأیید حذف سرور "${host.name}" (#${host.id})\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `آیا از حذف این سرور از سامانه TeleOps اطمینان دارید؟\n\n` +
+      `🛡 توجه ایمنی: حذف رکورد سرور فقط تنظیمات ذخیره‌شده در TeleOps را حذف می‌کند و هیچ‌گونه فایل، پروژه، پوشه یا اطلاعاتی از سیستم مقصد لینوکس حذف نخواهد شد.${warning}`;
+
+    return { text, kb };
+  }
+
+  private async projDetailSpec(uid: number, projId: number): Promise<{ text: string; kb: InlineKeyboard } | undefined> {
+    const p = resolveProject(this.app, uid, projId);
+    if (!p) return undefined;
+    const host = p.host_id ? this.app.hosts.getHost(p.host_id) : undefined;
+    const defProjId = this.app.db.getUserDefaultProjectId?.(uid);
+    const isDef = p.id === defProjId;
+    const allSessions = isAdminUser(this.app, uid) ? this.app.db.listSessions() : this.app.db.listSessionsForOwner(uid);
+    const projSessions = allSessions.filter((s) => s.project_id === p.id);
+    const activeCount = projSessions.filter((s) => ACTIVE_STATUSES.includes(s.status)).length;
+
+    const kb = new InlineKeyboard();
+    kb.text("🧩 سشن جدید برای این پروژه", `sessnew:prj:${p.host_id ?? 0}:${p.id}`).row()
+      .text("🔍 بررسی وضعیت مسیر و Git", `projcheck:${p.id}`)
+      .text(isDef ? "⭐ پروژه پیش‌فرض است" : "⭐ انتخاب به عنوان پیش‌فرض", `projdef:${p.id}`).row()
+      .text("✏️ تغییر نام پروژه", `projrename:${p.id}`)
+      .text("🗑 حذف ثبت پروژه", `projdelreq:${p.id}`).row();
+    this.navFooter(kb, true, true);
+
+    const text =
+      `📁 مشخصات پروژه: ${p.name}\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `• شناسه: #${p.id}\n` +
+      `• سرور میزبان: ${host ? `${host.name} (${host.host}:${host.port})` : "لوکال (TeleOps Host)"}\n` +
+      `• مسیر روی سرور: ${p.root}\n` +
+      `• توضیحات: ${p.description || "—"}\n` +
+      `• پروژه پیش‌فرض: ${isDef ? "⭐ بله" : "خیر"}\n` +
+      `• سشن‌های فعال: ${activeCount} از ${projSessions.length}\n` +
+      `• تاریخ ثبت: ${agoFa(p.created_at)}`;
+
+    return { text, kb };
+  }
+
+  private projDelReqSpec(uid: number, projId: number): { text: string; kb: InlineKeyboard } | undefined {
+    const p = resolveProject(this.app, uid, projId);
+    if (!p) return undefined;
+    const allSessions = isAdminUser(this.app, uid) ? this.app.db.listSessions() : this.app.db.listSessionsForOwner(uid);
+    const activeSessions = allSessions.filter((s) => s.project_id === p.id && ACTIVE_STATUSES.includes(s.status));
+
+    const kb = new InlineKeyboard();
+    kb.text("✅ بله، ثبت پروژه حذف شود", `projdel:${p.id}`)
+      .text("❌ انصراف", `projdetail:${p.id}`).row();
+    this.navFooter(kb, true, true);
+
+    let warn = "";
+    if (activeSessions.length > 0) {
+      warn = `\n\n❌ این پروژه دارای ${activeSessions.length} سشن فعال است. ابتدا سشن‌ها را متوقف یا حذف کنید.`;
+    }
+
+    const text =
+      `⚠️ تأیید حذف ثبت پروژه "${p.name}" (#${p.id})\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `آیا از حذف این پروژه از فهرست TeleOps اطمینان دارید؟\n\n` +
+      `🛡 توجه ایمنی: این عملیات فقط رکورد ثبت پروژه را از TeleOps پاک می‌کند و تمام فایل‌ها، پوشه‌ها و اطلاعات روی سرور کاملاً دست‌نخورده باقی می‌مانند.${warn}`;
+
+    return { text, kb };
+  }
+
+  private logsMenuSpec(uid: number): { text: string; kb: InlineKeyboard } {
+    const kb = new InlineKeyboard();
+    kb.text("💻 لاگ‌های عمومی سیستم", "logsview:system")
+      .text("🔴 لاگ خطاهای اخیر", "logsview:errors").row()
+      .text("🔌 لاگ‌های SSH و سرور", "logsview:ssh")
+      .text("🧩 رویدادهای سشن‌ها", "logsview:events").row()
+      .text("🛡 لاگ‌های امنیتی", "logsview:security")
+      .text("📋 لاگ‌های تسک‌ها", "logsview:tasks").row();
+    this.navFooter(kb, true, true);
+    return {
+      text: "📜 گزارش‌ها، لاگ‌ها و عیب‌یابی سیستم TeleOps\n\nبرای مشاهده لاگ‌ها، بخش مورد نظر خود را انتخاب کنید:",
+      kb,
+    };
+  }
+
+  private async logsViewSpec(uid: number, type: string): Promise<{ text: string; kb: InlineKeyboard }> {
+    const app = this.app;
+    let title = "📜 لاگ‌ها";
+    let body = "";
+
+    switch (type) {
+      case "system": {
+        title = "💻 لاگ‌های عمومی سیستم";
+        const modules = app.tracker.modules();
+        body = modules.map((m) => `[${m}] وضعیت: ${app.tracker.state(m)} · خطاهای ۲۴ ساعت: ${app.tracker.count24h(m)}`).join("\n");
+        break;
+      }
+      case "errors": {
+        title = "🔴 لاگ خطاهای اخیر";
+        const errs = app.tracker.recent(undefined, 15);
+        body = errs.length
+          ? errs.map((e) => `• [${e.module}] ${agoFa(e.at)}:\n  ${this.clip(e.message)}`).join("\n\n")
+          : "✅ هیچ خطای اخیری ثبت نشده است.";
+        break;
+      }
+      case "ssh": {
+        title = "🔌 لاگ‌های SSH و ارتباط سرور";
+        const conn = app.serverMode.connection;
+        const hosts = app.db.listHosts();
+        const lines: string[] = [];
+        if (conn) {
+          lines.push(`وضعیت اتصال جاری: ${conn.state}`);
+          if (conn.lastErrorMessage) lines.push(`آخرین پیام: ${conn.lastErrorMessage}`);
+        } else {
+          lines.push("اتصال سراسری SSH فعال نیست.");
+        }
+        lines.push("\nوضعیت سرورها:");
+        for (const h of hosts) {
+          lines.push(`• #${h.id} ${h.name} (${h.host}): ${h.last_connected_at ? `اتصال در ${agoFa(h.last_connected_at)}` : "بررسی نشده"}${h.last_error ? ` (خطا: ${h.last_error})` : ""}`);
+        }
+        body = lines.join("\n");
+        break;
+      }
+      case "events": {
+        title = "🧩 رویدادهای اخیر سشن‌ها";
+        const s = this.st(uid).activeSession;
+        const events = s ? app.db.listEvents(s, 20) : [];
+        body = events.length
+          ? events.map((e) => `• ${agoFa(e.created_at)} [${e.type}] ${JSON.stringify(e.payload ?? {}).slice(0, 100)}`).join("\n")
+          : (s ? "هیچ رویدادی برای سشن جاری ثبت نشده است." : "سشن فعالی انتخاب نشده است. از منوی سشن‌ها یک سشن را انتخاب کنید.");
+        break;
+      }
+      case "security": {
+        title = "🛡 لاگ‌های امنیتی و دسترسی";
+        const admins = app.config.security.admin_users?.length ?? "همگانی";
+        const allowed = app.config.security.allowed_users.length;
+        const approvals = app.approvals.pending();
+        body =
+          `کاربران مجاز: ${allowed}\n` +
+          `کاربران مدیر: ${admins}\n` +
+          `تأییدیه‌های امنیتی در انتظار: ${approvals.length}\n` +
+          (approvals.length ? approvals.map((a) => `• #${a.id} نوع: ${a.action_type} وضعیت: ${a.status}`).join("\n") : "✅ تأییدیه معلقی وجود ندارد.");
+        break;
+      }
+      case "tasks": {
+        title = "📋 لاگ‌های تسک‌ها";
+        const logs = isAdminUser(app, uid) ? app.db.listTaskLogs({}, 10) : app.db.listTaskLogsForOwner(uid, 10);
+        body = logs.length
+          ? logs.map((t) => `• #${t.id} سشن #${t.session_id} [${t.status}] ${agoFa(t.started_at)}\n  مسیر: ${t.remote_path}`).join("\n\n")
+          : "هنوز هیچ لاگ تسکی ثبت نشده است.";
+        break;
+      }
+    }
+
+    const kb = new InlineKeyboard();
+    kb.text("↻ بروزرسانی", `logsview:${type}`).row();
+    this.navFooter(kb, true, true);
+    return {
+      text: `${title}\n━━━━━━━━━━━━━━━━━━━━\n\n${this.clip(this.scrub(body))}`,
+      kb,
+    };
+  }
+
+  private settingsMenuSpec(uid: number): { text: string; kb: InlineKeyboard } {
+    const kb = new InlineKeyboard();
+    kb.text("👥 کاربران مجاز و دسترسی‌ها", "set:users")
+      .text("⭐ تعیین سرور پیش‌فرض", "set:defhost").row()
+      .text("📁 مسیرهای مجاز پروژه‌ها", "set:projroots")
+      .text("🔑 کلید احراز هویت Qoder", "set:qoder").row()
+      .text("🩺 وضعیت سلامت سرویس", "set:health")
+      .text("🔄 همگام‌سازی وضعیت سیستم (Reconcile)", "set:reconcile").row()
+      .text("ℹ️ اطلاعات نسخه و سیستم", "set:info").row();
+    this.navFooter(kb, true, true);
+    return {
+      text: "⚙️ تنظیمات و پیکربندی سیستم TeleOps\n\nبخش مورد نظر را انتخاب کنید:",
+      kb,
+    };
+  }
+
+  private async settingsSubSpec(uid: number, type: string): Promise<{ text: string; kb: InlineKeyboard }> {
+    const app = this.app;
+    const kb = new InlineKeyboard();
+    let text = "";
+
+    switch (type) {
+      case "users": {
+        const allowed = app.config.security.allowed_users;
+        const admins = app.config.security.admin_users ?? allowed;
+        text =
+          `👥 مدیریت کاربران و سطوح دسترسی\n━━━━━━━━━━━━━━━━━━━━\n` +
+          `• تعداد کل کاربران مجاز: ${allowed.length}\n` +
+          `• کاربران مجاز: ${allowed.join(", ")}\n` +
+          `• مدیران سامانه (Admin Users): ${admins.join(", ")}\n` +
+          `• شناسه شما: ${uid} (${isAdminUser(app, uid) ? "مدیر کل ⭐" : "کاربر استاندارد"})\n\n` +
+          `💡 نکته: جهت تغییر کاربران مجاز، فایل پیکربندی config.yaml را ویرایش کنید.`;
+        break;
+      }
+      case "defhost": {
+        const hosts = isAdminUser(app, uid) ? app.db.listHosts() : app.db.listHostsForOwner(uid);
+        const active = this.hostIdForUser(uid);
+        text = `⭐ تعیین سرور پیش‌فرض / فعال\n━━━━━━━━━━━━━━━━━━━━\nسرور پیش‌فرض برای اجرای دستورات و سشن‌های جدید را انتخاب کنید:\n\n`;
+        for (const h of hosts) {
+          const isAct = h.id === active;
+          kb.text(`${isAct ? "⭐" : "▫️"} ${h.name}`, `setdefhost:${h.id}`).row();
+          text += `• #${h.id} ${h.name} (${h.username}@${h.host}:${h.port}) ${isAct ? "← فعال" : ""}\n`;
+        }
+        if (!hosts.length) text += "هیچ سروری ثبت نشده است.";
+        break;
+      }
+      case "projroots": {
+        const ps = isAdminUser(app, uid) ? app.db.listProjects() : app.db.listProjectsForOwner(uid);
+        text =
+          `📁 مسیرهای مجاز و ثبت‌شده پروژه‌ها\n━━━━━━━━━━━━━━━━━━━━\n` +
+          `تعداد پروژه‌ها: ${ps.length}\n\n` +
+          ps.map((p) => `• #${p.id} ${p.name}: ${p.root} [${p.host_id ? `سرور #${p.host_id}` : "لوکال"}]`).join("\n");
+        break;
+      }
+      case "qoder": {
+        return this.qoderKeySpec(uid);
+      }
+      case "health": {
+        text = this.healthText();
+        break;
+      }
+      case "reconcile": {
+        const rec = await app.sessions.reconcile().catch((e: unknown) => ({ error: (e as Error).message }));
+        text =
+          `🔄 نتیجه همگام‌سازی وضعیت سیستم (Reconcile)\n━━━━━━━━━━━━━━━━━━━━\n` +
+          `سشن‌ها و پردازه‌های tmux با موفقیت با دیتابیس هماهنگ شدند.\n` +
+          `اطلاعات وضعیت جاری:\n${JSON.stringify(rec, null, 2)}`;
+        break;
+      }
+      case "info": {
+        const mem = process.memoryUsage();
+        text =
+          `ℹ️ مشخصات و وضعیت نسخه TeleOps\n━━━━━━━━━━━━━━━━━━━━\n` +
+          `• نام سیستم: TeleOps AI Command Center\n` +
+          `• پلتفرم: ${process.platform} (${process.arch})\n` +
+          `• نسخه Node.js: ${process.version}\n` +
+          `• زمان بالا بودن (Uptime): ${Math.round(process.uptime())} ثانیه\n` +
+          `• شناسه پردازه (PID): ${process.pid}\n` +
+          `• مصرف حافظه: ${Math.round(mem.rss / 1024 / 1024)} MB\n` +
+          `• ترنسپورت سشن‌ها: ${app.sessions.remoteMode ? "Remote SSH" : "Local Direct"}\n` +
+          `• آداپترهای فعال: ${app.adapters.ids().join(", ")}`;
+        break;
+      }
+    }
+
+    this.navFooter(kb, true, true);
+    return { text, kb };
   }
 
   private summaryText(id: number): string {
@@ -766,6 +1180,51 @@ export class TelegramController {
     if (!text) return;
     const state = this.st(ctx.from!.id);
 
+    if (state.pendingRename) {
+      if (text.startsWith("/")) return;
+      const { type, id } = state.pendingRename;
+      state.pendingRename = undefined;
+      const cleanName = text.trim();
+      if (!cleanName) {
+        await ctx.reply("❌ نام نمی‌تواند خالی باشد.");
+        return;
+      }
+      if (type === "server") {
+        app.db.updateHost(id, { name: cleanName });
+        await this.navigate(ctx, ctx.from!.id, `hostdetail:${id}`);
+      } else if (type === "project") {
+        app.db.updateProject(id, { name: cleanName });
+        await this.navigate(ctx, ctx.from!.id, `projdetail:${id}`);
+      } else if (type === "session") {
+        app.db.updateSession(id, { name: cleanName });
+        await this.enterChat(ctx, id);
+      }
+      return;
+    }
+
+    if (state.pendingInput) {
+      if (text.startsWith("/")) return;
+      const { sessionId } = state.pendingInput;
+      state.pendingInput = undefined;
+      const s = resolveSession(app, ctx.from!.id, sessionId);
+      if (!s) return this.deny(ctx);
+      try {
+        await app.sessions.sendInput(sessionId, text);
+        await this.enterChat(ctx, sessionId);
+      } catch (e) {
+        await this.fail(ctx, e);
+      }
+      return;
+    }
+
+    if (state.sessionWizard?.step === "name" || state.sessionWizard?.step === "task") {
+      if (text.startsWith("/")) return;
+      const sw = state.sessionWizard;
+      state.sessionWizard = undefined;
+      await this.finishSessionWizard(ctx, sw, text.trim());
+      return;
+    }
+
     if (state.pendingKeyEntry) {
       if (text.startsWith("/")) return;
       await this.handleKeyEntry(ctx, text);
@@ -777,21 +1236,28 @@ export class TelegramController {
       return;
     }
     if (state.projectWizard) {
-      // Project paths are absolute and therefore begin with '/'.  The old
-      // generic "ignore commands" guard discarded every valid Linux path
-      // before it reached registerProject.
-      if (text === "/cancel") return;
-      if (text.startsWith("/") && !text.slice(1).includes("/")) {
-        await ctx.reply("📁 I am waiting for an absolute project path. Send e.g. /srv/app, or /cancel first.");
+      if (text === "/cancel") {
+        state.projectWizard = undefined;
+        await ctx.reply("لغو شد.");
         return;
       }
-      const hostId = this.hostIdForUser(ctx.from!.id);
+      if (text.startsWith("/") && !text.slice(1).includes("/")) {
+        await ctx.reply("📁 یک مسیر معتبر روی سرور (مثلاً: /srv/app) را ارسال کنید، یا /cancel را بفرستید:");
+        return;
+      }
+      const hostId = typeof state.projectWizard === "object" && state.projectWizard.hostId
+        ? state.projectWizard.hostId
+        : this.hostIdForUser(ctx.from!.id);
       if (hostId === null) {
-        await ctx.reply("🔌 No server connected. Run /addserver first.");
+        await ctx.reply("🔌 هیچ سروری متصل نیست. ابتدا با دستور /addserver سرور خود را متصل کنید.");
         return;
       }
       const registered = await this.registerProject(ctx, hostId, text.trim());
-      if (registered) state.projectWizard = undefined;
+      if (registered) {
+        state.projectWizard = undefined;
+        const p = app.db.listRemoteProjects(hostId).find((x) => x.root.replace(/\/+$/, "") === text.trim().replace(/\/+$/, ""));
+        if (p) await this.navigate(ctx, ctx.from!.id, `projdetail:${p.id}`);
+      }
       return;
     }
     if (text.startsWith("/")) return;
@@ -816,7 +1282,7 @@ export class TelegramController {
       }
       return;
     }
-    await ctx.reply("Open a session with /sessions or /session <id>, then chat here.");
+    await ctx.reply("سشن را از منوی سشن‌ها باز کنید / Open a session via /sessions first to send it messages, or use /send <id> <message>.");
   }
 
   // ---------- registration ----------
@@ -893,9 +1359,9 @@ export class TelegramController {
     this.bot.command("sessions", (ctx) => this.sessionsOverview(ctx));
 
     this.bot.command("addserver", (ctx) => {
-      this.st(ctx.from!.id).serverWizard = { step: "host", draft: {} };
+      this.st(ctx.from!.id).serverWizard = { step: "name", draft: {} };
       return ctx.reply(
-        "🖥 Add server (1/4)\n\nSend the server address (IP or hostname).\nType /cancel to abort.",
+        "🖥 افزودن سرور (۱ از ۵)\n\nیک نام نمایشی دلخواه برای این سرور وارد کنید:\nبرای انصراف /cancel را بفرستید.",
       );
     });
 
@@ -1108,22 +1574,26 @@ export class TelegramController {
       ? this.app.db.listHosts()
       : this.app.db.listHostsForOwner(uid);
     const kb = new InlineKeyboard();
+    kb.text("➕ افزودن سرور جدید", "nav:addserver").row();
     if (!hosts.length) {
-      kb.text("➕ Add Server", "nav:addserver").row().text("⬅ Back", "back");
+      this.navFooter(kb, true, true);
       return {
-        text: "🖥 No servers registered for you yet. Use /addserver.",
+        text: "🖥 سرورهای من (SSH Hosts)\n\nهیچ سروری برای شما ثبت نشده است.\nاز دکمه «➕ افزودن سرور جدید» استفاده کنید.",
         kb,
       };
     }
     const active = this.hostIdForUser(uid);
     const lines = hosts.map((h) => {
-      const mine = h.owner_telegram_user_id === uid ? "you" : h.owner_telegram_user_id == null ? "legacy" : `owner ${h.owner_telegram_user_id}`;
-      kb.text(`${h.id}. ${h.name}`, `hostuse:${h.id}`).text("🗑", `hostdel:${h.id}`).row();
-      return `${h.id === active ? "⭐" : "  "} ${h.id}. ${h.name} — ${h.username}@${h.host}:${h.port}  (${h.visibility === "shared" ? "shared" : `private · ${mine}`})`;
+      const isDef = h.id === active;
+      const marker = isDef ? "⭐" : "▫️";
+      const mine = h.owner_telegram_user_id === uid ? "شخصی" : h.owner_telegram_user_id == null ? "عمومی" : `کاربر ${h.owner_telegram_user_id}`;
+      const status = h.last_connected_at ? `✅ ${agoFa(h.last_connected_at)}` : "⚪ بررسی‌نشده";
+      kb.text(`${marker} ${h.name} (${h.username}@${h.host})`, `hostdetail:${h.id}`).row();
+      return `${marker} #${h.id} ${h.name}\n   └ ${h.username}@${h.host}:${h.port} (${mine}) · وضعیت: ${status}`;
     });
-    kb.text("⬅ Back", "back");
+    this.navFooter(kb, true, true);
     return {
-      text: "🖥 MY SERVERS\n\n" + lines.join("\n") + "\n\n⭐ = your active server",
+      text: "🖥 سرورهای من (SSH Hosts)\n\n" + lines.join("\n\n") + "\n\n⭐ = سرور فعال شما\nبرای مشاهده مشخصات، تست اتصال یا تغییرات، روی سرور مورد نظر بزنید:",
       kb,
     };
   }
@@ -1137,46 +1607,60 @@ export class TelegramController {
     const host = resolveHost(this.app, uid, hostId);
     if (!host) return this.deny(ctx);
     this.app.hosts.activateHostForUser(uid, hostId);
-    let note = `🖥 Active server set to "${host.name}".`;
+    let note = `🖥 سرور فعال به "${host.name}" تغییر یافت.`;
     const globalActive = this.app.db.getActiveHost();
     if (globalActive?.id === hostId) {
       try {
         await this.app.serverMode.switchActiveHost(hostId);
-        note += "\nTransport switched to this server.";
+        note += "\nترنسپورت سراسری به این سرور متصل شد.";
       } catch (e) {
         this.app.tracker.report("ssh", e, { step: "switch_host", host: host.name });
-        note += `\n⚠️ Live switch failed: ${(e as Error).message}`;
+        note += `\n⚠️ خطای تغییر اتصال زنده: ${(e as Error).message}`;
       }
-    } else {
-      note += "\n⚠️ Another server is currently connected globally; ask an admin to switch the transport.";
     }
-    await ctx.reply(note);
+    await this.navigate(ctx, uid, `hostdetail:${hostId}`);
   }
 
   private async handleHostDelete(ctx: Context, hostId: number): Promise<void> {
     const uid = ctx.from!.id;
     const host = resolveHost(this.app, uid, hostId);
     if (!host) return this.deny(ctx);
-    // normal users may only delete hosts they own (not shared ones)
     if (!isAdminUser(this.app, uid) && (host.owner_telegram_user_id !== uid || host.visibility === "shared"))
       return this.deny(ctx);
     const projects = this.app.db.listRemoteProjects(hostId);
-    if (projects.some((p) => this.app.db.listSessionsForOwner(uid).some((s) => s.project_id === p.id))) {
-      await ctx.reply("❌ This server still has your active projects/sessions — remove them first.");
+    const allSessions = isAdminUser(this.app, uid) ? this.app.db.listSessions() : this.app.db.listSessionsForOwner(uid);
+    if (projects.some((p) => allSessions.some((s) => s.project_id === p.id && ACTIVE_STATUSES.includes(s.status)))) {
+      await ctx.reply("❌ این سرور دارای سشن‌های فعال است — ابتدا آن‌ها را متوقف کنید.");
       return;
     }
     this.app.db.deleteHost(hostId);
     this.app.db.raw().prepare("DELETE FROM user_active_hosts WHERE telegram_user_id = ? AND host_id = ?").run(uid, hostId);
-    let note = `🗑 Server "${host.name}" removed.`;
     if (isAdminUser(this.app, uid) && !this.app.db.getActiveHost()) {
       try {
         await this.app.serverMode.switchActiveHost(null);
-        note += "\nTransport returned to local.";
-      } catch {
-        /* noop */
-      }
+      } catch {}
     }
-    await ctx.reply(note);
+    await this.navigate(ctx, uid, "hosts");
+  }
+
+  private async handleHostTest(ctx: Context, hostId: number): Promise<void> {
+    const uid = ctx.from!.id;
+    const host = resolveHost(this.app, uid, hostId);
+    if (!host) return this.deny(ctx);
+    const testResult = await this.app.hosts.testHost(hostId);
+    const statusText = testResult.ok
+      ? `✅ اتصال SSH با موفقیت برقرار شد!\nمیزبان: ${testResult.hostname ?? host.host}\nکاربر: ${testResult.user ?? host.username}\n${testResult.tmux ? `نسخه tmux: ${testResult.tmux}` : "⚠️ برنامه tmux نصب نیست"}`
+      : `❌ خطا در برقراری ارتباط با سرور:\n${testResult.error ?? "خطای نامشخص"}`;
+    const kb = new InlineKeyboard()
+      .text("⚡ آزمایش مجدد", `hosttest:${hostId}`).row()
+      .text("⬅️ بازگشت به مشخصات سرور", `hostdetail:${hostId}`);
+    this.navFooter(kb, true, true);
+    await this.screen(
+      ctx,
+      `hosttest:${hostId}`,
+      `⚡ نتیجه آزمایش اتصال سرور "${host.name}":\n━━━━━━━━━━━━━━━━━━━━\n\n${statusText}`,
+      kb,
+    );
   }
 
   // ---------- history ----------
@@ -1215,86 +1699,119 @@ export class TelegramController {
     if (!w) return;
     const value = text.trim();
 
+    if (w.step === "name") {
+      w.draft.name = value;
+      w.step = "host";
+      await ctx.reply("🖥 افزودن سرور (۲ از ۵)\n\nآدرس سرور (IP یا Hostname) را ارسال کنید:\nبرای انصراف /cancel را بفرستید.");
+      return;
+    }
+
     if (w.step === "host") {
       if (!/^[a-zA-Z0-9._-]+$/.test(value)) {
-        await ctx.reply("❌ That doesn't look like a valid hostname or IP. Try again or /cancel.");
+        await ctx.reply("❌ آدرس وارد شده معتبر نیست. لطفاً مجدداً آدرس یا IP را ارسال کنید (یا /cancel):");
         return;
       }
       w.draft.host = value;
+      if (!w.draft.name) w.draft.name = value;
       w.step = "port";
-      await ctx.reply(`🖥 Add server (2/4)\n\nSSH port for ${value}? (send a number, or "default" for 22)`);
+      await ctx.reply(`🖥 افزودن سرور (۳ از ۵)\n\nپورت SSH برای ${value} را وارد کنید (یک عدد بین ۱ تا ۶۵۵۳۵، یا "default" برای ۲۲):`);
       return;
     }
+
     if (w.step === "port") {
       const port = value === "default" || value === "22" ? 22 : Number(value);
       if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        await ctx.reply('❌ Port must be a number 1–65535 (or "default"). Try again.');
+        await ctx.reply('❌ پورت باید عددی بین ۱ تا ۶۵۵۳۵ باشد (یا "default"):');
         return;
       }
       w.draft.port = port;
       w.step = "user";
-      await ctx.reply("🖥 Add server (3/4)\n\nSSH username?");
+      await ctx.reply("🖥 افزودن سرور (۴ از ۵)\n\nنام کاربری SSH سرور (مثلاً root یا ubuntu) را ارسال کنید:");
       return;
     }
+
     if (w.step === "user") {
       if (!/^[A-Za-z0-9._-]+$/.test(value)) {
-        await ctx.reply("❌ Invalid username. Try again or /cancel.");
+        await ctx.reply("❌ نام کاربری نامعتبر است. مجدداً تلاش کنید یا /cancel را بفرستید:");
         return;
       }
       w.draft.username = value;
-      w.step = "pass";
+      w.step = "auth_type";
+      const kb = new InlineKeyboard()
+        .text("🔑 کلید اختصاصی SSH (Key)", "srvwizard:auth:key")
+        .text("🔒 رمز عبور (Password)", "srvwizard:auth:password");
+      await ctx.reply("🖥 افزودن سرور (۵ از ۵)\n\nشیوه احراز هویت را انتخاب کنید:", { reply_markup: kb });
+      return;
+    }
+
+    if (w.step === "auth_type") {
+      w.draft.auth_type = value.toLowerCase().includes("key") ? "key" : "password";
+      w.step = "credential";
       await ctx.reply(
-        "🖥 Add server (4/4)\n\nSend the SSH password. It is stored encrypted (AES-256-GCM) " +
-          "and I will try to delete this message after saving.",
+        w.draft.auth_type === "key"
+          ? "🔑 متن کلید خصوصی SSH (Private Key) را بفرستید (پیام پس از ذخیره بلافاصله پاک خواهد شد):"
+          : "🔒 رمز عبور SSH را ارسال کنید (پیام پس از ذخیره بلافاصله پاک خواهد شد):",
       );
       return;
     }
 
-    // step "pass" — test, then persist (owned by this user) + activate
+    // step "credential" or "pass"
     if (!value) {
-      await ctx.reply("❌ Empty password. Try again or /cancel.");
+      await ctx.reply("❌ مقدار ارسال شده خالی است. مجدداً ارسال کنید یا /cancel را بفرستید.");
       return;
     }
-    const { host, port, username } = w.draft;
+    const { host, port, username, name, auth_type } = w.draft;
+    const finalAuth = auth_type ?? "password";
     const chatId = ctx.chat?.id;
-    const testing = await ctx.reply(`⏳ Testing connection to ${username}@${host}:${port}…`);
-    const result = await app.hosts.testConnection({ host: host!, port: port!, username: username!, password: value });
+    const userMsgId = ctx.msg?.message_id;
+
+    // Delete password / private key message immediately
+    if (chatId && userMsgId) {
+      try {
+        await this.bot.api.deleteMessage(chatId, userMsgId);
+      } catch {
+        app.logs.system.warn("could not delete credential message");
+      }
+    }
+
+    const testing = await ctx.reply(`⏳ در حال آزمایش اتصال واقعی SSH به ${username}@${host}:${port}…`);
+    const testCreds = finalAuth === "key"
+      ? { host: host!, port: port!, username: username!, privateKey: value }
+      : { host: host!, port: port!, username: username!, password: value };
+
+    const result = await app.hosts.testConnection(testCreds);
     try {
       if (chatId) await this.bot.api.deleteMessage(chatId, testing.message_id);
-    } catch {
-      /* noop */
-    }
+    } catch {}
+
     if (!result.ok) {
       await ctx.reply(
-        `❌ Connection failed: ${result.error ?? "unknown error"}\n\n` +
-          "Send the correct password to retry, or /cancel.",
+        `❌ اتصال به سرور ناموفق بود!\nخطای دریافتی:\n${result.error ?? "خطای نامشخص"}\n\n` +
+          "لطفاً اطلاعات احراز هویت صحیح را ارسال کنید یا برای انصراف /cancel را بفرستید.",
       );
       return;
     }
+
     let saved;
     try {
       saved = app.hosts.addHost({
+        name: name || host!,
         host: host!,
         port: port!,
         username: username!,
-        password: value,
+        auth_type: finalAuth,
+        password: finalAuth === "password" ? value : undefined,
+        private_key: finalAuth === "key" ? value : undefined,
         activate: true,
         owner: uid,
       });
     } catch (e) {
       app.tracker.report("config", e, { step: "save_host" });
-      await ctx.reply(`❌ Connected, but saving failed: ${(e as Error).message}`);
+      await ctx.reply(`❌ اتصال موفق بود اما ذخیره سرور ناموفق بود: ${(e as Error).message}`);
       return;
     }
     state.serverWizard = undefined;
-    try {
-      if (chatId && ctx.msg) await this.bot.api.deleteMessage(chatId, ctx.msg.message_id);
-    } catch {
-      app.logs.system.warn("could not delete password message — remove it manually");
-    }
-    // The global SSH transport follows the GLOBAL active host, which addHost
-    // only flips for admins (or when nothing was active yet). Normal users
-    // never steal the transport from another user's server.
+
     const globalActive = app.db.getActiveHost();
     if (globalActive?.id === saved.id) {
       try {
@@ -1302,24 +1819,24 @@ export class TelegramController {
       } catch (e) {
         app.tracker.report("ssh", e, { step: "switch_host", host: saved.name });
         await ctx.reply(
-          `⚠️ Host "${saved.name}" saved and tested OK, but the live switch failed: ${(e as Error).message}\n` +
-            "Re-run /addserver with the same address to retry.",
+          `⚠️ سرور ذخیره شد اما جابه‌جایی زنده ترنسپورت با خطا مواجه شد: ${(e as Error).message}\n` +
+            "با دستور /hosts وضعیت را بررسی کنید.",
         );
         return;
       }
       await ctx.reply(
-        `✅ Server connected: ${result.hostname ?? host} (user ${result.user ?? username})\n` +
-          `Transport switched to SSH — no restart needed.\n` +
-          (result.tmux ? `tmux: ${result.tmux}\n` : `⚠️ tmux NOT found on the server — install it before creating sessions.\n`) +
-          `\nNext: /addproject <path> to register a project on this server.`,
+        `✅ سرور "${saved.name}" با موفقیت متصل و ذخیره شد!\n` +
+          `ترنسپورت فعال سیستم به SSH متصل شد.\n` +
+          (result.tmux ? `نسخه tmux: ${result.tmux}\n` : `⚠️ برنامه tmux روی سرور یافت نشد — پیش از ایجاد سشن آن را نصب کنید.\n`) +
+          `\nاکنون می‌توانید با دکمه «📁 پروژه‌ها» مسیر پروژه خود را ثبت کنید.`,
       );
+      await this.navigate(ctx, uid, `hostdetail:${saved.id}`);
       return;
     }
     await ctx.reply(
-      `✅ Server "${saved.name}" saved as your private server (#${saved.id}) and set as YOUR active one.\n` +
-        `⚠️ Another server is currently connected globally, so remote execution still uses that host. ` +
-        `Ask an admin to switch (or /hosts → select) when yours should go live.`,
+      `✅ سرور "${saved.name}" (#${saved.id}) با موفقیت ذخیره و به‌عنوان سرور فعال شما تعیین شد.`,
     );
+    await this.navigate(ctx, uid, `hostdetail:${saved.id}`);
   }
 
   // ---------- project registration ----------
@@ -1372,6 +1889,100 @@ export class TelegramController {
         (isRepo ? "Git repository: ✅ yes" : "⚠️ Not a git repository — /git will not work for sessions here."),
     );
     return true;
+  }
+
+  private async handleProjectDelete(ctx: Context, projId: number): Promise<void> {
+    const uid = ctx.from!.id;
+    const p = resolveProject(this.app, uid, projId);
+    if (!p) return this.deny(ctx);
+    if (!canManageProject(this.app, uid, p)) return this.deny(ctx);
+    const allSessions = isAdminUser(this.app, uid) ? this.app.db.listSessions() : this.app.db.listSessionsForOwner(uid);
+    if (allSessions.some((s) => s.project_id === projId && ACTIVE_STATUSES.includes(s.status))) {
+      await ctx.reply(`❌ پروژه #${projId} دارای سشن فعال است — ابتدا سشن‌ها را متوقف یا حذف کنید.`);
+      return;
+    }
+    this.app.db.deleteProject(projId);
+    await this.navigate(ctx, uid, "projects");
+  }
+
+  private async handleProjectCheck(ctx: Context, projId: number): Promise<void> {
+    const uid = ctx.from!.id;
+    const p = resolveProject(this.app, uid, projId);
+    if (!p) return this.deny(ctx);
+    let pathOk = false;
+    let gitOk = false;
+    let details = "";
+    if (p.host_id) {
+      const exists = await this.app.serverMode.execOnHost(p.host_id, "test", ["-d", p.root]);
+      pathOk = exists.code === 0;
+      if (pathOk) {
+        const repoCheck = await this.app.serverMode.execOnHost(
+          p.host_id,
+          "git",
+          ["-C", p.root, "rev-parse", "--is-inside-work-tree"],
+        );
+        gitOk = repoCheck.code === 0 && repoCheck.stdout.trim() === "true";
+      } else {
+        details = exists.stderr ? ` (${exists.stderr.slice(0, 100)})` : "";
+      }
+    } else {
+      pathOk = fs.existsSync(p.root);
+      gitOk = await this.app.git.isRepo(p.root).catch(() => false);
+    }
+    const kb = new InlineKeyboard();
+    kb.text("🧩 سشن جدید", `sessnew:prj:${p.host_id ?? 0}:${p.id}`)
+      .text("⬅️ بازگشت به پروژه", `projdetail:${p.id}`);
+    this.navFooter(kb, true, true);
+    await this.screen(
+      ctx,
+      `projcheck:${projId}`,
+      `🔍 نتیجه بررسی مسیر و گیت پروژه "${p.name}":\n━━━━━━━━━━━━━━━━━━━━\n\n` +
+      `• مسیر روی سرور: ${p.root}\n` +
+      `• وجود دایرکتوری: ${pathOk ? "✅ موجود و قابل دسترس" : `❌ یافت نشد${details}`}\n` +
+      `• وضعیت Git: ${gitOk ? "✅ مخزن گیت معتبر" : "⚠️ مخزن گیت نیست"}`,
+      kb,
+    );
+  }
+
+  private async finishSessionWizard(
+    ctx: Context,
+    sw: SessionCreationWizard,
+    nameOrTask: string,
+  ): Promise<void> {
+    const uid = ctx.from!.id;
+    const app = this.app;
+    const project = sw.projectId ? resolveProject(app, uid, sw.projectId) : undefined;
+    const agent = sw.agent ?? "shell";
+    const cwd = project?.root ?? process.cwd();
+    const sessionName = nameOrTask ? `${agent} - ${nameOrTask.slice(0, 30)}` : `${agent} - ${project?.name ?? "adhoc"}`;
+
+    if (
+      this.app.adapters.get(agent)?.credentialEnvVar &&
+      !this.app.credentials.hasCredential(uid)
+    ) {
+      await ctx.reply(
+        CREDENTIAL_REQUIRED_MESSAGE +
+          "\n\nRun /qoderkey, tap “Set token” and reply with your token.",
+      );
+      return;
+    }
+
+    try {
+      const created = await app.sessions.create({
+        name: sessionName,
+        project_id: project?.id ?? null,
+        agent,
+        cwd,
+        owner_telegram_user_id: uid,
+      });
+      await app.sessions.start(created.id, nameOrTask || undefined);
+      this.st(uid).activeSession = created.id;
+      const branch = await app.git.currentBranch(cwd);
+      if (branch) app.db.updateSession(created.id, { branch });
+      await this.enterChat(ctx, created.id);
+    } catch (e) {
+      await this.fail(ctx, e);
+    }
   }
 
   // ---------- task logs ----------
@@ -1792,7 +2403,6 @@ export class TelegramController {
     const uid = ctx.from!.id;
     const app = this.app;
     const parts = data.split(":");
-
     // Navigation NEVER stacks new messages: every screen below is rendered by
     // EDITING the single recorded dashboard message (screen()); ⬅ Back pops the
     // per-user stack. Every branch acknowledges the callback.
@@ -1833,19 +2443,265 @@ export class TelegramController {
           await this.startWizard(ctx);
           break;
         case "addserver": {
-          this.st(uid).serverWizard = { step: "host", draft: {} };
-          await ctx.reply("🖥 Add server (1/4)\n\nSend the server address (IP or hostname).\nType /cancel to abort.");
+          this.st(uid).serverWizard = { step: "name", draft: {} };
+          await ctx.reply(
+            "🖥 افزودن سرور (۱ از ۵)\n\nیک نام نمایشی دلخواه برای این سرور وارد کنید:\nبرای انصراف /cancel را بفرستید.",
+          );
           break;
         }
         case "addproject": {
           const hostId = await this.requireRemote(ctx);
           if (hostId !== null) {
-            this.st(uid).projectWizard = true;
-            await ctx.reply("📁 Send the absolute project path on the server (e.g. /srv/app).\nType /cancel to abort.");
+            this.st(uid).projectWizard = { hostId };
+            await ctx.reply("📁 یک مسیر معتبر روی سرور (مثلاً: /srv/app) را ارسال کنید:\nبرای انصراف /cancel را بفرستید.");
           }
           break;
         }
       }
+      return ack();
+    }
+
+    if (data.startsWith("srvwizard:auth:")) {
+      const authType = parts[2] === "key" ? "key" : "password";
+      const state = this.st(uid);
+      if (state.serverWizard) {
+        state.serverWizard.draft.auth_type = authType;
+        state.serverWizard.step = "credential";
+        await ctx.reply(
+          authType === "key"
+            ? "🔑 متن کلید خصوصی SSH (Private Key) را بفرستید (پیام پس از ذخیره بلافاصله پاک خواهد شد):"
+            : "🔒 رمز عبور SSH را ارسال کنید (پیام پس از ذخیره بلافاصله پاک خواهد شد):",
+        );
+      }
+      return ack();
+    }
+
+    if (data.startsWith("hostdetail:")) {
+      await this.navigate(ctx, uid, `hostdetail:${parts[1]}`);
+      return ack();
+    }
+
+    if (data.startsWith("hosttest:")) {
+      await this.handleHostTest(ctx, Number(parts[1]));
+      return ack();
+    }
+
+    if (data.startsWith("hostdelreq:")) {
+      await this.navigate(ctx, uid, `hostdelreq:${parts[1]}`);
+      return ack();
+    }
+
+    if (data.startsWith("hostrename:")) {
+      const hid = Number(parts[1]);
+      if (!resolveHost(app, uid, hid)) {
+        await this.deny(ctx);
+        return ack();
+      }
+      this.st(uid).pendingRename = { type: "server", id: hid };
+      await ctx.reply("✏️ نام جدید سرور را ارسال کنید:\nبرای انصراف /cancel را بفرستید.");
+      return ack();
+    }
+
+    if (data.startsWith("hostprojs:")) {
+      await this.navigate(ctx, uid, "projects");
+      return ack();
+    }
+
+    if (data.startsWith("hostsess:")) {
+      await this.navigate(ctx, uid, "sessions");
+      return ack();
+    }
+
+    if (data.startsWith("projdetail:")) {
+      await this.navigate(ctx, uid, `projdetail:${parts[1]}`);
+      return ack();
+    }
+
+    if (data.startsWith("projcheck:")) {
+      await this.handleProjectCheck(ctx, Number(parts[1]));
+      return ack();
+    }
+
+    if (data.startsWith("projdef:")) {
+      const pid = Number(parts[1]);
+      const p = resolveProject(app, uid, pid);
+      if (!p) {
+        await this.deny(ctx);
+        return ack();
+      }
+      this.app.db.setUserDefaultProject?.(uid, pid);
+      await this.navigate(ctx, uid, `projdetail:${pid}`);
+      return ack();
+    }
+
+    if (data.startsWith("projrename:")) {
+      const pid = Number(parts[1]);
+      const p = resolveProject(app, uid, pid);
+      if (!p) {
+        await this.deny(ctx);
+        return ack();
+      }
+      this.st(uid).pendingRename = { type: "project", id: pid };
+      await ctx.reply("✏️ نام جدید پروژه را ارسال کنید:\nبرای انصراف /cancel را بفرستید.");
+      return ack();
+    }
+
+    if (data.startsWith("projdelreq:")) {
+      await this.navigate(ctx, uid, `projdelreq:${parts[1]}`);
+      return ack();
+    }
+
+    if (data.startsWith("projdel:")) {
+      await this.handleProjectDelete(ctx, Number(parts[1]));
+      return ack();
+    }
+
+    if (data === "projnew:start") {
+      const hostId = this.hostIdForUser(uid);
+      if (hostId === null) {
+        await ctx.reply("🔌 ابتدا از بخش «سرورها» یک سرور ثبت یا انتخاب کنید.");
+        return ack();
+      }
+      this.st(uid).projectWizard = { hostId };
+      await ctx.reply("📁 یک مسیر معتبر روی سرور (مثلاً: /srv/app) را ارسال کنید:\nبرای انصراف /cancel را بفرستید.");
+      return ack();
+    }
+
+    if (data === "sessnew:start") {
+      const hostId = this.hostIdForUser(uid);
+      const projects = hostId
+        ? this.app.db.listRemoteProjects(hostId).filter((p) => projectVisibleTo(app, uid, p))
+        : (isAdminUser(app, uid) ? this.app.db.listProjects() : this.app.db.listProjectsForOwner(uid));
+      if (!projects.length) {
+        await ctx.reply("📁 هیچ پروژه‌ای ثبت نشده است. ابتدا از بخش «پروژه‌ها» یک پروژه ثبت کنید.");
+        return ack();
+      }
+      const kb = new InlineKeyboard();
+      for (const p of projects) {
+        kb.text(p.name, `sessnew:prj:${p.host_id ?? 0}:${p.id}`).row();
+      }
+      this.navFooter(kb, true, true);
+      await this.screen(ctx, "sessnew:pickproj", "➕ ایجاد سشن جدید — گام ۱: انتخاب پروژه:\n\nپروژه مورد نظر را انتخاب کنید:", kb);
+      return ack();
+    }
+
+    if (data.startsWith("sessnew:prj:")) {
+      const projId = Number(parts[3] ?? parts[2]);
+      const p = resolveProject(app, uid, projId);
+      if (!p) {
+        await this.deny(ctx);
+        return ack();
+      }
+      const kb = new InlineKeyboard();
+      kb.text("💻 ترمینال شل لینوکس (Shell / Bash)", `sessnew:mode:${projId}:shell`).row();
+      for (const a of app.adapters.ids()) {
+        if (a !== "shell") kb.text(`🤖 ایجنت هوش مصنوعی ${a}`, `sessnew:mode:${projId}:${a}`).row();
+      }
+      this.navFooter(kb, true, true);
+      await this.screen(ctx, `sessnew:pickagent:${projId}`, `➕ ایجاد سشن برای پروژه "${p.name}" — گام ۲: نوع سشن:\n\nحالت اجرای سشن را انتخاب کنید:`, kb);
+      return ack();
+    }
+
+    if (data.startsWith("sessnew:mode:")) {
+      const projId = Number(parts[2]);
+      const agent = parts[3];
+      const p = resolveProject(app, uid, projId);
+      if (!p) {
+        await this.deny(ctx);
+        return ack();
+      }
+      if (agent === "shell") {
+        await this.finishSessionWizard(ctx, { step: "name", projectId: projId, agent: "shell" }, "");
+      } else {
+        this.st(uid).sessionWizard = { step: "task", projectId: projId, agent };
+        await ctx.reply(`🤖 تسک یا دستور اولیه برای ایجنت ${agent} را ارسال کنید:\nبرای انصراف /cancel را بفرستید.`);
+      }
+      return ack();
+    }
+
+    if (data.startsWith("sessrefresh:")) {
+      await this.enterChat(ctx, Number(parts[1]));
+      return ack();
+    }
+
+    if (data.startsWith("sessin:")) {
+      const sid = Number(parts[1]);
+      if (!resolveSession(app, uid, sid)) {
+        await this.deny(ctx);
+        return ack();
+      }
+      this.st(uid).pendingInput = { sessionId: sid };
+      await ctx.reply(`⌨️ ورودی یا پیام خود برای سشن #${sid} را بفرستید:\nبرای انصراف /cancel را بفرستید.`);
+      return ack();
+    }
+
+    if (data.startsWith("sessctrlc:")) {
+      const sid = Number(parts[1]);
+      if (!resolveSession(app, uid, sid)) {
+        await this.deny(ctx);
+        return ack();
+      }
+      try {
+        await app.sessions.sendKey(sid, "C-c");
+        await ctx.reply(`🛑 کلید Ctrl+C به سشن #${sid} ارسال شد.`);
+        await this.enterChat(ctx, sid);
+      } catch (e) {
+        await this.fail(ctx, e);
+      }
+      return ack();
+    }
+
+    if (data.startsWith("sessstopreq:")) {
+      const sid = Number(parts[1]);
+      if (!resolveSession(app, uid, sid)) {
+        await this.deny(ctx);
+        return ack();
+      }
+      await this.safe(() => app.sessions.stop(sid), ctx, `⏹ سشن #${sid} متوقف شد.`);
+      await this.enterChat(ctx, sid);
+      return ack();
+    }
+
+    if (data.startsWith("sessresume:")) {
+      const sid = Number(parts[1]);
+      if (!resolveSession(app, uid, sid)) {
+        await this.deny(ctx);
+        return ack();
+      }
+      await this.safe(() => app.sessions.resume(sid), ctx, `▶ سشن #${sid} ادامه یافت.`);
+      await this.enterChat(ctx, sid);
+      return ack();
+    }
+
+    if (data.startsWith("sessrename:")) {
+      const sid = Number(parts[1]);
+      if (!resolveSession(app, uid, sid)) {
+        await this.deny(ctx);
+        return ack();
+      }
+      this.st(uid).pendingRename = { type: "session", id: sid };
+      await ctx.reply(`✏️ نام جدید سشن #${sid} را ارسال کنید:\nبرای انصراف /cancel را بفرستید.`);
+      return ack();
+    }
+
+    if (data.startsWith("logsview:")) {
+      await this.navigate(ctx, uid, `logsview:${parts[1]}`);
+      return ack();
+    }
+
+    if (data.startsWith("set:")) {
+      await this.navigate(ctx, uid, `set:${parts[1]}`);
+      return ack();
+    }
+
+    if (data.startsWith("setdefhost:")) {
+      const hid = Number(parts[1]);
+      if (!resolveHost(app, uid, hid)) {
+        await this.deny(ctx);
+        return ack();
+      }
+      this.app.hosts.activateHostForUser(uid, hid);
+      await this.navigate(ctx, uid, "set:defhost");
       return ack();
     }
 
@@ -1988,6 +2844,10 @@ export class TelegramController {
     }
 
     if (data.startsWith("git:")) {
+      if (parts.length === 2) {
+        await this.gitView(ctx, Number(parts[1]));
+        return ack();
+      }
       await this.handleGitCallback(ctx, parts);
       return ack();
     }

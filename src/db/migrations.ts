@@ -142,6 +142,33 @@ DROP TABLE IF EXISTS credential_grants;
 `);
     },
   },
+  {
+    version: 8,
+    name: "server_and_project_metadata_and_dashboards",
+    up: (db) => {
+      addColumn(db, "ssh_hosts", "auth_type", "TEXT NOT NULL DEFAULT 'password'");
+      addColumn(db, "ssh_hosts", "private_key_enc", "TEXT");
+      addColumn(db, "ssh_hosts", "last_connected_at", "TEXT");
+      addColumn(db, "ssh_hosts", "last_error", "TEXT");
+      addColumn(db, "projects", "description", "TEXT");
+      db.exec(`
+CREATE TABLE IF NOT EXISTS user_default_projects (
+  telegram_user_id INTEGER PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS user_dashboards (
+  telegram_user_id INTEGER PRIMARY KEY,
+  chat_id INTEGER NOT NULL,
+  message_id INTEGER NOT NULL,
+  screen_key TEXT NOT NULL,
+  nav_stack TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+`);
+    },
+  },
 ];
 
 function addColumn(

@@ -40,7 +40,7 @@ import {
  *    central allowlist and the active-transport/host consistency rule.
  */
 
-const ALLOWED_KEYS = new Set([
+export const ALLOWED_KEYS = new Set([
   "C-c",
   "C-d",
   "C-l",
@@ -292,6 +292,12 @@ export class TerminalService {
     t.lastUsedMs = Date.now();
     this.ensurePolling(userId, t);
     await this.tmux().sendKey(t.name, key);
+  }
+
+  async resize(userId: number, cols: number, rows: number): Promise<void> {
+    const t = this.terms.get(userId);
+    if (!t) return;
+    await this.tmux().resizePane(t.name, cols, rows);
   }
 
   /** Input never goes to a shell that has already exited. */

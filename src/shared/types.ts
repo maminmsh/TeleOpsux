@@ -74,6 +74,7 @@ export interface Project {
   owner_telegram_user_id: number | null;
   /** "shared" resources are usable by all allowed users; only admins may manage them. */
   visibility: ResourceVisibility;
+  description?: string | null;
   created_at: string;
 }
 
@@ -85,11 +86,24 @@ export interface SshHost {
   username: string;
   /** AES-256-GCM encrypted password, base64 (iv:tag:ciphertext). Never sent to logs/Telegram. */
   password_enc: string;
+  auth_type?: "password" | "key";
+  private_key_enc?: string | null;
+  last_connected_at?: string | null;
+  last_error?: string | null;
   is_active: number;
   /** Owning Telegram user; NULL = legacy row, admin-only. */
   owner_telegram_user_id: number | null;
   visibility: ResourceVisibility;
   created_at: string;
+  updated_at: string;
+}
+
+export interface UserDashboard {
+  telegram_user_id: number;
+  chat_id: number;
+  message_id: number;
+  screen_key: string;
+  nav_stack?: string | null;
   updated_at: string;
 }
 

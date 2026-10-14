@@ -133,6 +133,11 @@ button:disabled { opacity:.45; }
       <button id="stop">⏹ Stop</button>
       <button id="resume">▶ Resume</button>
       <button id="copy">⧉ Copy</button>
+      <button id="vcc">^C</button>
+      <button id="vtab">Tab</button>
+      <button id="vesc">Esc</button>
+      <button id="vup">▲</button>
+      <button id="vdown">▼</button>
     </div>
     <div id="sendrow">
       <textarea id="input" rows="1" placeholder="Message to the agent…"></textarea>
@@ -145,6 +150,10 @@ button:disabled { opacity:.45; }
     <pre id="tout"></pre>
     <div id="tcontrols">
       <button id="tcc">^C Interrupt</button>
+      <button id="ttab">Tab</button>
+      <button id="tesc">Esc</button>
+      <button id="tup">▲</button>
+      <button id="tdown">▼</button>
       <button id="tcopy">⧉ Copy</button>
       <button id="tstop">⏹ Stop terminal</button>
     </div>
@@ -471,9 +480,35 @@ $("tstop").onclick = function () {
 };
 $("tcopy").onclick = function () {
   var txt = "";
-  $("tout").childNodes.forEach(function (n) { txt += n.textContent + "\\n"; });
+  $("tout").childNodes.forEach(function (n) { txt += n.textContent + "\n"; });
   (navigator.clipboard ? navigator.clipboard.writeText(txt) : Promise.reject()).catch(function () { banner("Copy is unavailable in this client."); });
 };
+function sendVirtualKey(which, key) {
+  var p = which === "agent" ? "/api/session/key?id=" + state.id : "/api/terminal/key";
+  api(p, { method: "POST", body: JSON.stringify({ key: key }) }).catch(function (e) { banner(e.message); });
+}
+if ($("vcc")) $("vcc").onclick = function () { sendVirtualKey("agent", "C-c"); };
+if ($("vtab")) $("vtab").onclick = function () { sendVirtualKey("agent", "Tab"); };
+if ($("vesc")) $("vesc").onclick = function () { sendVirtualKey("agent", "Escape"); };
+if ($("vup")) $("vup").onclick = function () { sendVirtualKey("agent", "Up"); };
+if ($("vdown")) $("vdown").onclick = function () { sendVirtualKey("agent", "Down"); };
+
+if ($("ttab")) $("ttab").onclick = function () { sendVirtualKey("term", "Tab"); };
+if ($("tesc")) $("tesc").onclick = function () { sendVirtualKey("term", "Escape"); };
+if ($("tup")) $("tup").onclick = function () { sendVirtualKey("term", "Up"); };
+if ($("tdown")) $("tdown").onclick = function () { sendVirtualKey("term", "Down"); };
+
+function triggerResize() {
+  var cols = Math.max(40, Math.floor(window.innerWidth / 8.5));
+  var rows = Math.max(15, Math.floor((window.innerHeight - 200) / 18));
+  if (state.id != null && state.view === "detail") {
+    api("/api/session/resize?id=" + state.id, { method: "POST", body: JSON.stringify({ cols: cols, rows: rows }) }).catch(function(){});
+  }
+  if (state.termOpen && state.view === "terminal") {
+    api("/api/terminal/resize", { method: "POST", body: JSON.stringify({ cols: cols, rows: rows }) }).catch(function(){});
+  }
+}
+window.addEventListener("resize", triggerResize);
 
 // ---------- detail actions ----------
 function syncViewUI() {

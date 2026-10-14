@@ -15,6 +15,7 @@ import {
   SessionStatus,
   SshHost,
   TaskLog,
+  UserDashboard,
 } from "../shared/types";
 
 const SCHEMA = `
@@ -104,18 +105,28 @@ export class DB {
     host_id?: number | null,
     owner_telegram_user_id?: number | null,
     visibility: ResourceVisibility = "private",
+    description?: string | null,
   ): Project {
     const info = this.db
       .prepare(
-        "INSERT INTO projects (name, root, host_id, owner_telegram_user_id, visibility) VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO projects (name, root, host_id, owner_telegram_user_id, visibility, description) VALUES (?, ?, ?, ?, ?, ?)",
       )
-      .run(name, root, host_id ?? null, owner_telegram_user_id ?? null, visibility);
+      .run(name, root, host_id ?? null, owner_telegram_user_id ?? null, visibility, description ?? null);
     return this.getProject(Number(info.lastInsertRowid))!;
   }
   getProject(id: number): Project | undefined {
     return this.db.prepare("SELECT * FROM projects WHERE id = ?").get(id) as
       | Project
       | undefined;
+  }
+  updateProject(
+    id: number,
+    patch: Partial<Pick<Project, "name" | "root" | "description" | "visibility">>,
+  ): void {
+    const keys = Object.keys(patch);
+    if (keys.length === 0) return;
+    const sets = keys.map((k) => `${k} = @${k}`).join(", ");
+    this.db.prepare(`UPDATE projects SET ${sets} WHERE id = @id`).run({ ...patch, id });
   }
   /** Admin view: everything. Normal users must use listProjectsForOwner. */
   listProjects(): Project[] {
@@ -145,6 +156,55 @@ export class DB {
       .run(ownerTelegramUserId, id);
   }
 
+  // ---- user default project ----
+  getUserDefaultProjectId(telegramUserId: number): number | null {
+    const row = this.db
+      .prepare("SELECT project_id FROM user_default_projects WHERE telegram_user_id = ?")
+      .get(telegramUserId) as { project_id: number } | undefined;
+    return row?.project_id ?? null;
+  }
+  setUserDefaultProject(telegramUserId: number, projectId: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO user_default_projects (telegram_user_id, project_id, updated_at)
+         VALUES (?, ?, datetime('now'))
+         ON CONFLICT(telegram_user_id) DO UPDATE SET project_id = excluded.project_id, updated_at = excluded.updated_at`,
+      )
+      .run(telegramUserId, projectId);
+  }
+  clearUserDefaultProject(telegramUserId: number): void {
+    this.db
+      .prepare("DELETE FROM user_default_projects WHERE telegram_user_id = ?")
+      .run(telegramUserId);
+  }
+
+  // ---- user persistent dashboard navigation ----
+  getUserDashboard(telegramUserId: number): UserDashboard | null {
+    const row = this.db
+      .prepare("SELECT * FROM user_dashboards WHERE telegram_user_id = ?")
+      .get(telegramUserId) as UserDashboard | undefined;
+    return row ?? null;
+  }
+  upsertUserDashboard(telegramUserId: number, chatId: number, messageId: number, screenKey: string, navStack?: string | null): void {
+    this.db
+      .prepare(
+        `INSERT INTO user_dashboards (telegram_user_id, chat_id, message_id, screen_key, nav_stack, updated_at)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(telegram_user_id) DO UPDATE SET
+           chat_id = excluded.chat_id,
+           message_id = excluded.message_id,
+           screen_key = excluded.screen_key,
+           nav_stack = excluded.nav_stack,
+           updated_at = excluded.updated_at`,
+      )
+      .run(telegramUserId, chatId, messageId, screenKey, navStack ?? null);
+  }
+  clearUserDashboard(telegramUserId: number): void {
+    this.db
+      .prepare("DELETE FROM user_dashboards WHERE telegram_user_id = ?")
+      .run(telegramUserId);
+  }
+
   // ---- ssh hosts ----
   createHost(h: {
     name: string;
@@ -152,17 +212,21 @@ export class DB {
     port: number;
     username: string;
     password_enc: string;
+    auth_type?: "password" | "key";
+    private_key_enc?: string | null;
     owner_telegram_user_id?: number | null;
     visibility?: ResourceVisibility;
   }): SshHost {
     const info = this.db
       .prepare(
-        `INSERT INTO ssh_hosts (name, host, port, username, password_enc, owner_telegram_user_id, visibility)
-         VALUES (@name, @host, @port, @username, @password_enc, @owner_telegram_user_id, @visibility)`,
+        `INSERT INTO ssh_hosts (name, host, port, username, password_enc, auth_type, private_key_enc, owner_telegram_user_id, visibility)
+         VALUES (@name, @host, @port, @username, @password_enc, @auth_type, @private_key_enc, @owner_telegram_user_id, @visibility)`,
       )
       .run({
         owner_telegram_user_id: null,
         visibility: "private" as ResourceVisibility,
+        auth_type: "password",
+        private_key_enc: null,
         ...h,
       });
     return this.getHost(Number(info.lastInsertRowid))!;
@@ -174,7 +238,7 @@ export class DB {
   }
   updateHost(
     id: number,
-    patch: Partial<Pick<SshHost, "host" | "port" | "username" | "password_enc" | "name">>,
+    patch: Partial<Pick<SshHost, "host" | "port" | "username" | "password_enc" | "auth_type" | "private_key_enc" | "last_connected_at" | "last_error" | "name">>,
   ): void {
     const keys = Object.keys(patch);
     if (keys.length === 0) return;

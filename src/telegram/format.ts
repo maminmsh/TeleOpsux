@@ -134,3 +134,44 @@ export function gitStatusText(st: GitStatus): string {
   if (st.clean) return `${head}\n\nWorking tree clean.`;
   return `${head}\n\nModified:\n${st.modified.map((m) => "  " + m).join("\n")}`;
 }
+
+export function statusFarsi(status: string): string {
+  switch (status) {
+    case "WORKING":
+      return "🟢 در حال اجرا";
+    case "WAITING_INPUT":
+      return "🟡 در انتظار ورودی کاربر";
+    case "WAITING_APPROVAL":
+      return "🟡 در انتظار تأیید عملیات";
+    case "ERROR":
+      return "🔴 خطا در اجرا";
+    case "CRASHED":
+      return "🔴 پردازش متوقف شد (Crash)";
+    case "STOPPING":
+      return "⏳ در حال توقف";
+    case "STOPPED":
+      return "⏹ متوقف‌شده";
+    case "FINISHED":
+      return "✅ پایان‌یافته";
+    case "STARTING":
+      return "⏳ در حال راه‌اندازی";
+    case "CREATED":
+      return "⚪ ایجادشده";
+    default:
+      return status;
+  }
+}
+
+export function agoFa(iso: string): string {
+  const t = Date.parse(iso.includes("T") ? iso : iso + "Z");
+  if (Number.isNaN(t)) return "نامشخص";
+  const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (s < 60) return `${s} ثانیه پیش`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m} دقیقه پیش`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h} ساعت پیش`;
+  const d = Math.floor(h / 24);
+  return `${d} روز پیش`;
+}
+

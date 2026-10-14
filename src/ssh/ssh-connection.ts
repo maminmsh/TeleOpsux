@@ -7,7 +7,8 @@ export interface SshHostCredentials {
   host: string;
   port: number;
   username: string;
-  password: string;
+  password?: string;
+  privateKey?: string;
 }
 
 export interface SshConnectionOptions {
@@ -216,16 +217,18 @@ export class SshConnection extends EventEmitter {
           this.emit("disconnected");
         }
       });
-      client.connect({
+      const connectOpts: Record<string, unknown> = {
         host: this.creds.host,
         port: this.creds.port,
         username: this.creds.username,
-        password: this.creds.password,
         tryKeyboard: false,
         keepaliveInterval: this.keepaliveMs,
         keepaliveCountMax: 3,
         readyTimeout: this.readyTimeoutMs,
-      });
+      };
+      if (this.creds.privateKey) connectOpts.privateKey = this.creds.privateKey;
+      else if (this.creds.password) connectOpts.password = this.creds.password;
+      client.connect(connectOpts as never);
     });
   }
 

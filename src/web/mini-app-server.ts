@@ -1,7 +1,7 @@
 import http from "node:http";
 import { App } from "../core/container";
 import { OutputHub, sessionKey, storedHistoryLines, terminalKey } from "./output-hub";
-import { resolveTransportHome, TerminalService } from "./terminal-service";
+import { ALLOWED_KEYS, resolveTransportHome, TerminalService } from "./terminal-service";
 import { validateInitData } from "./telegram-init-data";
 import { MINI_APP_HTML } from "./mini-app-page";
 import {
@@ -282,6 +282,14 @@ export class MiniAppServer {
           await this.terminals.stop(uid);
           return { ok: true };
         });
+      case "POST /api/terminal/resize":
+        return this.action(uid, res, async () => {
+          const body = await this.readBody(req);
+          const cols = Number(body.cols ?? 80);
+          const rows = Number(body.rows ?? 24);
+          await this.terminals.resize(uid, cols, rows);
+          return { ok: true };
+        });
       case "GET /api/terminal/status":
         return this.json(res, 200, this.terminals.status(uid));
       case "GET /api/terminal/events":
@@ -333,6 +341,22 @@ export class MiniAppServer {
           const text = String(body.text ?? "");
           if (!text.trim()) throw new Error("Empty message.");
           await this.app.sessions.sendInput(id, text);
+          return { ok: true };
+        });
+      case "POST /api/session/key":
+        return this.action(uid, res, async () => {
+          const body = await this.readBody(req);
+          const key = String(body.key ?? "");
+          if (!ALLOWED_KEYS.has(key)) throw new Error("Key not allowed.");
+          await this.app.sessions.sendKey(id, key);
+          return { ok: true };
+        });
+      case "POST /api/session/resize":
+        return this.action(uid, res, async () => {
+          const body = await this.readBody(req);
+          const cols = Number(body.cols ?? 80);
+          const rows = Number(body.rows ?? 24);
+          await this.app.sessions.resize(id, cols, rows);
           return { ok: true };
         });
       case "POST /api/session/stop":
